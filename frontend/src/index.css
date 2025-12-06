@@ -1,0 +1,125 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --soc-bg: #0a0e14;
+  --soc-panel: #0d1117;
+  --soc-border: #1c2128;
+  --soc-text: #c9d1d9;
+  --soc-muted: #6e7681;
+  --vital-normal: #3fb950;
+  --vital-warning: #d29922;
+  --vital-critical: #f85149;
+  --vital-info: #58a6ff;
+  --accent-cyan: #39c5cf;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--soc-bg);
+  color: var(--soc-text);
+  font-family: 'JetBrains Mono', monospace;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--soc-bg);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--soc-border);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--soc-muted);
+}
+
+/* Grid pattern background */
+.grid-bg {
+  background-image: 
+    linear-gradient(rgba(57, 197, 207, 0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(57, 197, 207, 0.03) 1px, transparent 1px);
+  background-size: 20px 20px;
+}
+
+/* Glowing border effect */
+.glow-border {
+  box-shadow: 
+    0 0 0 1px rgba(57, 197, 207, 0.2),
+    0 0 20px rgba(57, 197, 207, 0.1),
+    inset 0 0 20px rgba(57, 197, 207, 0.05);
+}
+
+/* Alert severity colors */
+.severity-critical {
+  background: linear-gradient(135deg, rgba(248, 81, 73, 0.2), rgba(248, 81, 73, 0.1));
+  border-left: 3px solid #f85149;
+}
+
+.severity-high {
+  background: linear-gradient(135deg, rgba(210, 153, 34, 0.2), rgba(210, 153, 34, 0.1));
+  border-left: 3px solid #d29922;
+}
+
+.severity-medium {
+  background: linear-gradient(135deg, rgba(88, 166, 255, 0.2), rgba(88, 166, 255, 0.1));
+  border-left: 3px solid #58a6ff;
+}
+
+/* Pulse animation for live indicator */
+@keyframes live-pulse {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.5;
+    transform: scale(1.2);
+  }
+}
+
+.live-indicator {
+  animation: live-pulse 1.5s ease-in-out infinite;
+}
+
+/* Chart area styling */
+.recharts-cartesian-grid-horizontal line,
+.recharts-cartesian-grid-vertical line {
+  stroke: rgba(57, 197, 207, 0.1);
+}
+
+.recharts-tooltip-wrapper {
+  z-index: 1000;
+}
+
+/* Scanline effect */
+.scanline::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: linear-gradient(
+    transparent 50%,
+    rgba(0, 0, 0, 0.05) 50%
+  );
+  background-size: 100% 4px;
+  pointer-events: none;
+  opacity: 0.3;
+}
+

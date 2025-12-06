@@ -1,0 +1,179 @@
+version: '3.8'
+
+services:
+  # ============================================
+  # MESSAGE BUS - Kafka + Zookeeper
+  # ============================================
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    hostname: zookeeper
+    container_name: telara-zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - telara-network
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo ruok | nc localhost 2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    hostname: kafka
+    container_name: telara-kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    networks:
+      - telara-network
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  # ============================================
+  # STREAM PROCESSOR - Apache Flink (PyFlink)
+  # ============================================
+  flink-jobmanager:
+    build:
+      context: ./stream-processor
+      dockerfile: Dockerfile
+    hostname: flink-jobmanager
+    container_name: telara-flink-jobmanager
+    ports:
+      - "8081:8081"
+    command: jobmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 2
+        parallelism.default: 1
+    networks:
+      - telara-network
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  flink-taskmanager:
+    build:
+      context: ./stream-processor
+      dockerfile: Dockerfile
+    hostname: flink-taskmanager
+    container_name: telara-flink-taskmanager
+    command: taskmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 2
+        parallelism.default: 1
+    networks:
+      - telara-network
+    depends_on:
+      - flink-jobmanager
+
+  flink-job-submitter:
+    build:
+      context: ./stream-processor
+      dockerfile: Dockerfile
+    hostname: flink-job-submitter
+    container_name: telara-flink-job-submitter
+    command: >
+      bash -c "
+        echo 'Waiting for Flink cluster to be ready...' &&
+        sleep 30 &&
+        echo 'Submitting PyFlink job...' &&
+        python /opt/flink/jobs/flink_job.py
+      "
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: flink-jobmanager
+    networks:
+      - telara-network
+    depends_on:
+      - flink-jobmanager
+      - flink-taskmanager
+
+  # ============================================
+  # DATA GENERATOR - Python Biometrics Producer
+  # ============================================
+  data-generator:
+    build:
+      context: ./data-generator
+      dockerfile: Dockerfile
+    hostname: data-generator
+    container_name: telara-data-generator
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: biometrics-raw
+      EVENT_INTERVAL_MS: 500
+    networks:
+      - telara-network
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  # ============================================
+  # API LAYER - FastAPI + WebSockets
+  # ============================================
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    hostname: api
+    container_name: telara-api
+    ports:
+      - "8000:8000"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_RAW_TOPIC: biometrics-raw
+      KAFKA_ALERTS_TOPIC: biometrics-alerts
+    networks:
+      - telara-network
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  # ============================================
+  # FRONTEND - React Dashboard
+  # ============================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    hostname: frontend
+    container_name: telara-frontend
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_WS_URL: ws://localhost:8000/ws/vitals
+      VITE_API_URL: http://localhost:8000
+    networks:
+      - telara-network
+    depends_on:
+      - api
+
+networks:
+  telara-network:
+    driver: bridge
+
