@@ -71,6 +71,10 @@ async def init_database():
                 avg_temp REAL,
                 avg_activity REAL,
                 avg_respiratory_rate REAL,
+                std_heart_rate REAL DEFAULT 0,
+                std_hrv REAL DEFAULT 0,
+                std_spo2 REAL DEFAULT 0,
+                std_temp REAL DEFAULT 0,
                 data_points INTEGER DEFAULT 0,
                 updated_at DATETIME
             )
@@ -317,6 +321,10 @@ class AlertsRepository:
 class BaselinesRepository:
     """Repository for user baseline operations."""
     
+    # Exponential moving average alpha (weight for new values)
+    # Lower = slower adaptation, higher = faster adaptation
+    EMA_ALPHA = 0.1
+    
     @staticmethod
     async def update(user_id: str, vitals_stats: Dict) -> bool:
         """Update user baselines with new data."""
@@ -375,6 +383,195 @@ class BaselinesRepository:
             return False
     
     @staticmethod
+    async def auto_update_baseline(user_id: str, vital_data: Dict) -> bool:
+        """
+        Automatically update baseline with a single vital reading.
+        Uses exponential moving average for smooth updates.
+        Called on each incoming vital to maintain real-time baselines.
+        """
+        try:
+            alpha = BaselinesRepository.EMA_ALPHA
+            
+            async with get_db() as db:
+                cursor = await db.execute(
+                    "SELECT * FROM user_baselines WHERE user_id = ?",
+                    (user_id,)
+                )
+                existing = await cursor.fetchone()
+                
+                hr = vital_data.get("heart_rate")
+                hrv = vital_data.get("hrv_ms")
+                spo2 = vital_data.get("spo2_percent")
+                temp = vital_data.get("skin_temp_c")
+                activity = vital_data.get("activity_level")
+                
+                if existing:
+                    # EMA update: new_avg = alpha * new_value + (1 - alpha) * old_avg
+                    new_hr = alpha * hr + (1 - alpha) * existing["avg_heart_rate"] if hr else existing["avg_heart_rate"]
+                    new_hrv = alpha * hrv + (1 - alpha) * existing["avg_hrv"] if hrv else existing["avg_hrv"]
+                    new_spo2 = alpha * spo2 + (1 - alpha) * existing["avg_spo2"] if spo2 else existing["avg_spo2"]
+                    new_temp = alpha * temp + (1 - alpha) * existing["avg_temp"] if temp else existing["avg_temp"]
+                    new_activity = alpha * activity + (1 - alpha) * existing["avg_activity"] if activity else existing["avg_activity"]
+                    
+                    # Update variance estimates using Welford's online algorithm (simplified)
+                    n = existing["data_points"] + 1
+                    old_std_hr = existing.get("std_heart_rate") or 0
+                    old_std_hrv = existing.get("std_hrv") or 0
+                    old_std_spo2 = existing.get("std_spo2") or 0
+                    old_std_temp = existing.get("std_temp") or 0
+                    
+                    # Simple running std estimate
+                    new_std_hr = ((1 - alpha) * old_std_hr**2 + alpha * (hr - new_hr)**2)**0.5 if hr else old_std_hr
+                    new_std_hrv = ((1 - alpha) * old_std_hrv**2 + alpha * (hrv - new_hrv)**2)**0.5 if hrv else old_std_hrv
+                    new_std_spo2 = ((1 - alpha) * old_std_spo2**2 + alpha * (spo2 - new_spo2)**2)**0.5 if spo2 else old_std_spo2
+                    new_std_temp = ((1 - alpha) * old_std_temp**2 + alpha * (temp - new_temp)**2)**0.5 if temp else old_std_temp
+                    
+                    await db.execute("""
+                        UPDATE user_baselines SET
+                            avg_heart_rate = ?,
+                            avg_hrv = ?,
+                            avg_spo2 = ?,
+                            avg_temp = ?,
+                            avg_activity = ?,
+                            std_heart_rate = ?,
+                            std_hrv = ?,
+                            std_spo2 = ?,
+                            std_temp = ?,
+                            data_points = ?,
+                            updated_at = ?
+                        WHERE user_id = ?
+                    """, (
+                        new_hr, new_hrv, new_spo2, new_temp, new_activity,
+                        new_std_hr, new_std_hrv, new_std_spo2, new_std_temp,
+                        n, datetime.utcnow().isoformat(), user_id
+                    ))
+                else:
+                    # Insert initial baseline
+                    await db.execute("""
+                        INSERT INTO user_baselines (
+                            user_id, avg_heart_rate, avg_hrv, avg_spo2,
+                            avg_temp, avg_activity, std_heart_rate, std_hrv,
+                            std_spo2, std_temp, data_points, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, 5, 5, 1, 0.2, 1, ?)
+                    """, (
+                        user_id,
+                        hr or 72, hrv or 50, spo2 or 98, temp or 36.5, activity or 20,
+                        datetime.utcnow().isoformat()
+                    ))
+                
+                await db.commit()
+                return True
+        except Exception as e:
+            print(f"Error auto-updating baseline: {e}")
+            return False
+    
+    @staticmethod
+    async def get_deviation_alert(user_id: str, current_vitals: Dict) -> Optional[Dict]:
+        """
+        Check if current vitals deviate significantly from baseline.
+        Returns personalized alert info if deviation detected.
+        """
+        baseline = await BaselinesRepository.get(user_id)
+        if not baseline or baseline.get("data_points", 0) < 10:
+            return None  # Not enough data for personalized alerts
+        
+        deviations = []
+        
+        # Check heart rate
+        hr = current_vitals.get("heart_rate")
+        if hr and baseline.get("avg_heart_rate"):
+            baseline_hr = baseline["avg_heart_rate"]
+            std_hr = baseline.get("std_heart_rate") or 8
+            pct_change = ((hr - baseline_hr) / baseline_hr) * 100
+            z_score = (hr - baseline_hr) / std_hr if std_hr > 0 else 0
+            
+            if abs(pct_change) > 15 or abs(z_score) > 2:
+                deviations.append({
+                    "metric": "heart_rate",
+                    "label": "Heart Rate",
+                    "current": hr,
+                    "baseline": round(baseline_hr, 0),
+                    "unit": "bpm",
+                    "percent_change": round(pct_change, 1),
+                    "direction": "higher" if pct_change > 0 else "lower",
+                    "severity": "high" if abs(pct_change) > 25 else "moderate",
+                    "message": f"Your HR is {hr} bpm - {abs(round(pct_change))}% {'higher' if pct_change > 0 else 'lower'} than YOUR typical {round(baseline_hr)} bpm"
+                })
+        
+        # Check HRV
+        hrv = current_vitals.get("hrv_ms")
+        if hrv and baseline.get("avg_hrv"):
+            baseline_hrv = baseline["avg_hrv"]
+            std_hrv = baseline.get("std_hrv") or 10
+            pct_change = ((hrv - baseline_hrv) / baseline_hrv) * 100
+            z_score = (hrv - baseline_hrv) / std_hrv if std_hrv > 0 else 0
+            
+            if pct_change < -20 or z_score < -2:  # Low HRV is concerning
+                deviations.append({
+                    "metric": "hrv_ms",
+                    "label": "HRV",
+                    "current": hrv,
+                    "baseline": round(baseline_hrv, 0),
+                    "unit": "ms",
+                    "percent_change": round(pct_change, 1),
+                    "direction": "lower",
+                    "severity": "high" if pct_change < -30 else "moderate",
+                    "message": f"Your HRV is {hrv} ms - {abs(round(pct_change))}% lower than YOUR typical {round(baseline_hrv)} ms (indicates reduced recovery)"
+                })
+        
+        # Check SpO2
+        spo2 = current_vitals.get("spo2_percent")
+        if spo2 and baseline.get("avg_spo2"):
+            baseline_spo2 = baseline["avg_spo2"]
+            if spo2 < 95 or (spo2 < baseline_spo2 - 2):
+                pct_change = ((spo2 - baseline_spo2) / baseline_spo2) * 100
+                deviations.append({
+                    "metric": "spo2_percent",
+                    "label": "Blood Oxygen",
+                    "current": spo2,
+                    "baseline": round(baseline_spo2, 0),
+                    "unit": "%",
+                    "percent_change": round(pct_change, 1),
+                    "direction": "lower",
+                    "severity": "high" if spo2 < 94 else "moderate",
+                    "message": f"Your SpO2 is {spo2}% - below YOUR typical {round(baseline_spo2)}%"
+                })
+        
+        # Check Temperature
+        temp = current_vitals.get("skin_temp_c")
+        if temp and baseline.get("avg_temp"):
+            baseline_temp = baseline["avg_temp"]
+            std_temp = baseline.get("std_temp") or 0.3
+            diff = temp - baseline_temp
+            
+            if abs(diff) > 0.5:
+                pct_change = (diff / baseline_temp) * 100
+                deviations.append({
+                    "metric": "skin_temp_c",
+                    "label": "Temperature",
+                    "current": round(temp, 1),
+                    "baseline": round(baseline_temp, 1),
+                    "unit": "°C",
+                    "percent_change": round(pct_change, 1),
+                    "direction": "higher" if diff > 0 else "lower",
+                    "severity": "high" if abs(diff) > 1.0 else "moderate",
+                    "message": f"Your temp is {round(temp, 1)}°C - {round(abs(diff), 1)}°C {'above' if diff > 0 else 'below'} YOUR typical {round(baseline_temp, 1)}°C"
+                })
+        
+        if not deviations:
+            return None
+        
+        # Sort by severity
+        deviations.sort(key=lambda x: 0 if x["severity"] == "high" else 1)
+        
+        return {
+            "has_deviation": True,
+            "deviations": deviations,
+            "baseline_data_points": baseline.get("data_points", 0),
+            "primary_deviation": deviations[0] if deviations else None
+        }
+    
+    @staticmethod
     async def get(user_id: str = "user_001") -> Optional[Dict]:
         """Get user baselines."""
         async with get_db() as db:
@@ -402,6 +599,7 @@ class BaselinesRepository:
                 "baseline": round(baseline["avg_heart_rate"], 1),
                 "difference": round(hr_diff, 1),
                 "percent_change": round(hr_pct, 1),
+                "std": round(baseline.get("std_heart_rate") or 0, 1),
                 "status": "elevated" if hr_pct > 15 else "low" if hr_pct < -15 else "normal"
             }
         
@@ -413,6 +611,7 @@ class BaselinesRepository:
                 "baseline": round(baseline["avg_hrv"], 1),
                 "difference": round(hrv_diff, 1),
                 "percent_change": round(hrv_pct, 1),
+                "std": round(baseline.get("std_hrv") or 0, 1),
                 "status": "low" if hrv_pct < -20 else "high" if hrv_pct > 20 else "normal"
             }
         
@@ -422,6 +621,7 @@ class BaselinesRepository:
                 "current": current_vitals["spo2_percent"],
                 "baseline": round(baseline["avg_spo2"], 1),
                 "difference": round(spo2_diff, 1),
+                "std": round(baseline.get("std_spo2") or 0, 1),
                 "status": "low" if current_vitals["spo2_percent"] < 95 else "normal"
             }
         
@@ -431,6 +631,7 @@ class BaselinesRepository:
                 "current": current_vitals["skin_temp_c"],
                 "baseline": round(baseline["avg_temp"], 2),
                 "difference": round(temp_diff, 2),
+                "std": round(baseline.get("std_temp") or 0, 2),
                 "status": "elevated" if temp_diff > 0.5 else "low" if temp_diff < -0.5 else "normal"
             }
         

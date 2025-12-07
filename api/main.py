@@ -27,6 +27,11 @@ from database import (
 )
 from claude_agent import get_agent, HealthCoachAgent
 from wellness import calculate_wellness_score, get_wellness_recommendations
+from correlations import get_correlation_insights
+from recommendations import get_recommendations
+from digest import generate_daily_digest
+from predictions import get_predictions
+from historical import get_week_comparison
 
 
 # Configuration
@@ -120,10 +125,13 @@ class ConnectionManager:
             self.active_connections.discard(conn)
     
     async def _store_message(self, message: dict):
-        """Store message to database."""
+        """Store message to database and update baselines."""
         try:
             if message["type"] == "vital":
                 await VitalsRepository.insert(message["data"])
+                # Auto-update user baseline with each vital reading
+                user_id = message["data"].get("user_id", "user_001")
+                await BaselinesRepository.auto_update_baseline(user_id, message["data"])
             elif message["type"] == "alert":
                 await AlertsRepository.insert(message["data"])
         except Exception as e:
@@ -324,6 +332,110 @@ async def get_baseline():
     """Get user baseline data."""
     baseline = await BaselinesRepository.get()
     return baseline or {"message": "No baseline established yet"}
+
+
+@app.get("/wellness/deviation")
+async def get_baseline_deviation():
+    """
+    Check if current vitals deviate from user's personal baseline.
+    Returns personalized alerts like 'Your HR is 95 bpm - 20% higher than YOUR typical 78 bpm'.
+    """
+    latest_vital = await VitalsRepository.get_latest()
+    if not latest_vital:
+        return {"has_deviation": False, "message": "No recent vitals"}
+    
+    deviation = await BaselinesRepository.get_deviation_alert("user_001", latest_vital)
+    if not deviation:
+        return {"has_deviation": False, "message": "Vitals are within your normal range"}
+    
+    return deviation
+
+
+# ==============================================================================
+# REST Endpoints - Correlations
+# ==============================================================================
+
+@app.get("/correlations")
+async def get_correlations(hours: int = Query(default=24, le=168)):
+    """
+    Get correlation insights between health metrics.
+    Discovers patterns like 'sleep < 6 hours correlates with 25% lower HRV next day'.
+    """
+    insights = await get_correlation_insights(hours=hours)
+    return insights
+
+
+# ==============================================================================
+# REST Endpoints - Recommendations
+# ==============================================================================
+
+@app.get("/recommendations")
+async def get_health_recommendations(limit: int = Query(default=5, le=10)):
+    """
+    Get personalized health recommendations based on current vitals, alerts, and wellness score.
+    Returns actionable suggestions prioritized by urgency.
+    """
+    # Get current data
+    vitals = await VitalsRepository.get_recent(minutes=30)
+    latest_vital = vitals[0] if vitals else {}
+    alerts = await AlertsRepository.get_recent(hours=24)
+    baseline = await BaselinesRepository.get()
+    
+    # Get wellness breakdown
+    score, breakdown = await calculate_wellness_score(vitals, alerts, baseline)
+    
+    # Generate recommendations
+    recs = await get_recommendations(
+        vitals=latest_vital,
+        alerts=alerts,
+        wellness_breakdown=breakdown,
+        baseline=baseline,
+        limit=limit
+    )
+    
+    return recs
+
+
+# ==============================================================================
+# REST Endpoints - Daily Digest
+# ==============================================================================
+
+@app.get("/digest/daily")
+async def get_daily_digest():
+    """
+    Get daily health digest - 'Your Day at a Glance'.
+    Includes key metrics vs yesterday, AI observations, and recommendations.
+    """
+    digest = await generate_daily_digest()
+    return digest
+
+
+# ==============================================================================
+# REST Endpoints - Predictions
+# ==============================================================================
+
+@app.get("/predictions")
+async def get_health_predictions(max_hours: float = Query(default=6, le=12)):
+    """
+    Get predictive health alerts based on current trends.
+    Predicts threshold crossings, fatigue, and stress states.
+    """
+    predictions = await get_predictions(max_hours=max_hours)
+    return predictions
+
+
+# ==============================================================================
+# REST Endpoints - Historical Comparison
+# ==============================================================================
+
+@app.get("/comparison/weekly")
+async def get_weekly_comparison():
+    """
+    Get week-over-week health comparison.
+    Compares this week vs last week with improvements/regressions analysis.
+    """
+    comparison = await get_week_comparison()
+    return comparison
 
 
 # ==============================================================================

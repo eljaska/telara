@@ -21,7 +21,7 @@ from database import (
 from wellness import calculate_wellness_score, get_wellness_recommendations
 
 # Configuration
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 MODEL = "claude-opus-4-5-20251101"
 
 # System prompt for the health coach

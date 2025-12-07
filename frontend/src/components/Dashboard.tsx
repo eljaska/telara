@@ -1,6 +1,6 @@
 /**
  * Main Dashboard Component
- * Integrates all health monitoring components
+ * Integrates all health monitoring components including Tier 2 & 3 features
  */
 
 import { useState } from 'react';
@@ -11,6 +11,11 @@ import { WellnessGauge } from './WellnessGauge';
 import { HealthChat } from './HealthChat';
 import { Timeline } from './Timeline';
 import { ControlPanel } from './ControlPanel';
+import { CorrelationInsights } from './CorrelationInsights';
+import { DailyDigest } from './DailyDigest';
+import { PredictiveInsights } from './PredictiveInsights';
+import { IntegrationDemo } from './IntegrationDemo';
+import { WeekComparison } from './WeekComparison';
 import { 
   Activity, 
   Wifi, 
@@ -24,7 +29,12 @@ import {
   TrendingUp,
   MessageSquare,
   Settings,
-  LayoutGrid
+  LayoutGrid,
+  Brain,
+  Link2,
+  BarChart3,
+  Calendar,
+  X
 } from 'lucide-react';
 
 // API URLs from environment or defaults
@@ -98,12 +108,14 @@ function VitalIndicator({
   );
 }
 
-type ViewMode = 'dashboard' | 'chat' | 'control';
+type ViewMode = 'dashboard' | 'insights' | 'integrations' | 'control';
 
 export function Dashboard() {
   const { vitals, alerts, latestVital, connectionState, eventsPerSecond } = useWebSocket(100);
   const [viewMode, setViewMode] = useState<ViewMode>('dashboard');
   const [showChat, setShowChat] = useState(true);
+  const [showDigest, setShowDigest] = useState(false);
+  const [showWeekComparison, setShowWeekComparison] = useState(false);
   
   const formatTime = () => {
     return new Date().toLocaleTimeString('en-US', {
@@ -149,6 +161,28 @@ export function Dashboard() {
               >
                 <LayoutGrid size={16} />
                 Dashboard
+              </button>
+              <button
+                onClick={() => setViewMode('insights')}
+                className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm transition-colors ${
+                  viewMode === 'insights'
+                    ? 'bg-accent-purple/20 text-accent-purple'
+                    : 'text-soc-muted hover:text-soc-text'
+                }`}
+              >
+                <Brain size={16} />
+                AI Insights
+              </button>
+              <button
+                onClick={() => setViewMode('integrations')}
+                className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm transition-colors ${
+                  viewMode === 'integrations'
+                    ? 'bg-vital-normal/20 text-vital-normal'
+                    : 'text-soc-muted hover:text-soc-text'
+                }`}
+              >
+                <Link2 size={16} />
+                Integrations
               </button>
               <button
                 onClick={() => setShowChat(!showChat)}
@@ -237,107 +271,176 @@ export function Dashboard() {
           />
         </div>
 
-        {/* Main Grid */}
-        <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
-          {/* Left Column - Wellness Score & Control */}
-          <div className="lg:col-span-1 space-y-4">
-            <WellnessGauge apiUrl={API_URL} />
-            
-            {viewMode === 'control' && (
-              <ControlPanel apiUrl={API_URL} />
-            )}
-            
-            <Timeline 
-              vitals={vitals}
-              alerts={alerts}
-              selectedMetric="heart_rate"
-            />
+        {/* Insights View */}
+        {viewMode === 'insights' && (
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
+            <div className="lg:col-span-1">
+              <DailyDigest apiUrl={API_URL} />
+            </div>
+            <div className="lg:col-span-1">
+              <PredictiveInsights apiUrl={API_URL} />
+            </div>
+            <div className="lg:col-span-1">
+              <WeekComparison apiUrl={API_URL} />
+            </div>
+            <div className="lg:col-span-3">
+              <CorrelationInsights apiUrl={API_URL} />
+            </div>
           </div>
+        )}
 
-          {/* Center Column - Charts */}
-          <div className="lg:col-span-2 space-y-4">
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <VitalChart
-                data={vitals}
-                metric="heart_rate"
-                title="Heart Rate"
-                unit="bpm"
-                color="#f85149"
-                warningThreshold={100}
-                criticalThreshold={120}
-                normalRange={[60, 100]}
-              />
-              <VitalChart
-                data={vitals}
-                metric="hrv_ms"
-                title="Heart Rate Variability"
-                unit="ms"
-                color="#a371f7"
-                normalRange={[40, 70]}
-              />
-            </div>
-            
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <VitalChart
-                data={vitals}
-                metric="spo2_percent"
-                title="Blood Oxygen (SpO2)"
-                unit="%"
-                color="#58a6ff"
-                normalRange={[95, 100]}
-              />
-              <VitalChart
-                data={vitals}
-                metric="skin_temp_c"
-                title="Body Temperature"
-                unit="°C"
-                color="#d29922"
-                warningThreshold={37.5}
-                criticalThreshold={38.5}
-                normalRange={[36.0, 37.2]}
-              />
-            </div>
+        {/* Integrations View */}
+        {viewMode === 'integrations' && (
+          <div className="mb-6">
+            <IntegrationDemo />
+          </div>
+        )}
 
-            {/* System Status Bar */}
-            <div className="bg-soc-panel border border-soc-border rounded-lg p-4">
-              <div className="flex items-center justify-between text-sm">
-                <div className="flex items-center gap-6">
-                  <div className="flex items-center gap-2">
-                    <div className="w-2 h-2 rounded-full bg-vital-normal live-indicator" />
-                    <span className="text-soc-muted">Kafka</span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <div className="w-2 h-2 rounded-full bg-vital-normal live-indicator" />
-                    <span className="text-soc-muted">Flink CEP</span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <div className="w-2 h-2 rounded-full bg-vital-normal live-indicator" />
-                    <span className="text-soc-muted">Claude AI</span>
-                  </div>
-                </div>
-                <div className="text-soc-muted font-mono">
-                  Buffered: {vitals.length} vitals | {alerts.length} alerts
-                </div>
+        {/* Dashboard/Control View */}
+        {(viewMode === 'dashboard' || viewMode === 'control') && (
+          <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
+            {/* Left Column - Wellness Score & Insights */}
+            <div className="lg:col-span-1 space-y-4">
+              <WellnessGauge apiUrl={API_URL} />
+              
+              {viewMode === 'control' && (
+                <ControlPanel apiUrl={API_URL} />
+              )}
+              
+              {/* Quick Actions */}
+              <div className="flex gap-2">
+                <button
+                  onClick={() => setShowDigest(!showDigest)}
+                  className={`flex-1 flex items-center justify-center gap-2 p-2 rounded-lg text-xs transition-colors ${
+                    showDigest
+                      ? 'bg-accent-cyan/20 text-accent-cyan border border-accent-cyan/30'
+                      : 'bg-soc-panel border border-soc-border text-soc-muted hover:text-soc-text'
+                  }`}
+                >
+                  <Calendar size={14} />
+                  Digest
+                </button>
+                <button
+                  onClick={() => setShowWeekComparison(!showWeekComparison)}
+                  className={`flex-1 flex items-center justify-center gap-2 p-2 rounded-lg text-xs transition-colors ${
+                    showWeekComparison
+                      ? 'bg-accent-purple/20 text-accent-purple border border-accent-purple/30'
+                      : 'bg-soc-panel border border-soc-border text-soc-muted hover:text-soc-text'
+                  }`}
+                >
+                  <BarChart3 size={14} />
+                  Weekly
+                </button>
               </div>
+              
+              {showDigest && (
+                <DailyDigest apiUrl={API_URL} />
+              )}
+              
+              {showWeekComparison && (
+                <WeekComparison apiUrl={API_URL} />
+              )}
+              
+              {!showDigest && !showWeekComparison && (
+                <>
+                  <CorrelationInsights apiUrl={API_URL} />
+                  <Timeline 
+                    vitals={vitals}
+                    alerts={alerts}
+                    selectedMetric="heart_rate"
+                  />
+                </>
+              )}
             </div>
-          </div>
 
-          {/* Right Column - Threat Log & Chat */}
-          <div className="lg:col-span-1 space-y-4">
-            {showChat ? (
-              <div className="h-[400px]">
-                <HealthChat 
-                  wsUrl={CHAT_WS_URL}
-                  apiUrl={API_URL}
+            {/* Center Column - Charts */}
+            <div className="lg:col-span-2 space-y-4">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <VitalChart
+                  data={vitals}
+                  metric="heart_rate"
+                  title="Heart Rate"
+                  unit="bpm"
+                  color="#f85149"
+                  warningThreshold={100}
+                  criticalThreshold={120}
+                  normalRange={[60, 100]}
+                />
+                <VitalChart
+                  data={vitals}
+                  metric="hrv_ms"
+                  title="Heart Rate Variability"
+                  unit="ms"
+                  color="#a371f7"
+                  normalRange={[40, 70]}
                 />
               </div>
-            ) : null}
-            
-            <div className={showChat ? 'h-[300px]' : 'h-[600px]'}>
-              <ThreatLog alerts={alerts} />
+              
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <VitalChart
+                  data={vitals}
+                  metric="spo2_percent"
+                  title="Blood Oxygen (SpO2)"
+                  unit="%"
+                  color="#58a6ff"
+                  normalRange={[95, 100]}
+                />
+                <VitalChart
+                  data={vitals}
+                  metric="skin_temp_c"
+                  title="Body Temperature"
+                  unit="°C"
+                  color="#d29922"
+                  warningThreshold={37.5}
+                  criticalThreshold={38.5}
+                  normalRange={[36.0, 37.2]}
+                />
+              </div>
+
+              {/* Predictive Insights (compact) */}
+              <PredictiveInsights apiUrl={API_URL} />
+
+              {/* System Status Bar */}
+              <div className="bg-soc-panel border border-soc-border rounded-lg p-4">
+                <div className="flex items-center justify-between text-sm">
+                  <div className="flex items-center gap-6">
+                    <div className="flex items-center gap-2">
+                      <div className="w-2 h-2 rounded-full bg-vital-normal live-indicator" />
+                      <span className="text-soc-muted">Kafka</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <div className="w-2 h-2 rounded-full bg-vital-normal live-indicator" />
+                      <span className="text-soc-muted">Flink CEP</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <div className="w-2 h-2 rounded-full bg-vital-normal live-indicator" />
+                      <span className="text-soc-muted">Claude AI</span>
+                    </div>
+                  </div>
+                  <div className="text-soc-muted font-mono">
+                    Buffered: {vitals.length} vitals | {alerts.length} alerts
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Right Column - Threat Log & Chat */}
+            <div className="lg:col-span-1 space-y-4">
+              {showChat ? (
+                <div className="h-[400px]">
+                  <HealthChat 
+                    wsUrl={CHAT_WS_URL}
+                    apiUrl={API_URL}
+                  />
+                </div>
+              ) : null}
+              
+              <div className={showChat ? 'h-[300px]' : 'h-[600px]'}>
+                <ThreatLog alerts={alerts} />
+              </div>
             </div>
           </div>
-        </div>
+        )}
       </main>
 
       {/* Footer */}
@@ -352,4 +455,3 @@ export function Dashboard() {
     </div>
   );
 }
-

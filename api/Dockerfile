@@ -20,6 +20,11 @@ COPY database.py .
 COPY wellness.py .
 COPY claude_agent.py .
 COPY kafka_consumer.py .
+COPY correlations.py .
+COPY recommendations.py .
+COPY digest.py .
+COPY predictions.py .
+COPY historical.py .
 COPY main.py .
 
 # Expose port
