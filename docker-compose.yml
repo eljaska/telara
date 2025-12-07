@@ -115,7 +115,11 @@ services:
       - flink-taskmanager
 
   # ============================================
-  # DATA GENERATOR - Python Biometrics Producer
+  # DATA GENERATOR - Multi-Source Biometrics Producer
+  # Produces to separate Kafka topics per source:
+  #   - biometrics-apple (Apple HealthKit)
+  #   - biometrics-google (Google Fit)
+  #   - biometrics-oura (Oura Ring)
   # ============================================
   data-generator:
     build:
@@ -127,10 +131,11 @@ services:
       - "8001:8001"
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      KAFKA_TOPIC: biometrics-raw
+      KAFKA_TOPIC: biometrics-raw  # Legacy fallback
       EVENT_INTERVAL_MS: 500
       AUTO_START: "true"
       AUTO_ANOMALY: "false"
+      MULTI_SOURCE: "true"  # Enable multi-source mode
       CONTROL_PORT: 8001
     networks:
       - telara-network
@@ -140,6 +145,9 @@ services:
 
   # ============================================
   # API LAYER - FastAPI + WebSockets + AI
+  # Consumes from multiple Kafka topics:
+  #   - biometrics-apple, biometrics-google, biometrics-oura
+  #   - biometrics-alerts (from Flink CEP)
   # ============================================
   api:
     build:
@@ -151,7 +159,7 @@ services:
       - "8000:8000"
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      KAFKA_RAW_TOPIC: biometrics-raw
+      KAFKA_RAW_TOPIC: biometrics-raw  # Legacy fallback
       KAFKA_ALERTS_TOPIC: biometrics-alerts
       GENERATOR_CONTROL_URL: http://data-generator:8001
       DATABASE_PATH: /app/data/telara.db

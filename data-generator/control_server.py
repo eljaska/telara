@@ -1,61 +1,179 @@
 """
 Telara Data Generator Control Server
-HTTP API for controlling the biometric data generator.
+HTTP API for controlling the multi-source biometric data generator.
 """
 
 import os
 import threading
+import time
 from flask import Flask, jsonify, request
-from producer import BiometricProducer
+from producer import (
+    BiometricProducer, 
+    MultiSourceProducer, 
+    SOURCE_CONFIGS,
+    generate_historical_data,
+    set_multi_source_producer,
+    get_multi_source_producer
+)
 
 app = Flask(__name__)
 
-# Global producer instance
-producer: BiometricProducer = None
+# Global producer instances
+multi_producer: MultiSourceProducer = None
+legacy_producer: BiometricProducer = None
 producer_thread: threading.Thread = None
 producer_lock = threading.Lock()
 
 
-def get_producer() -> BiometricProducer:
-    """Get or create the producer instance."""
-    global producer
-    if producer is None:
+def get_multi_producer() -> MultiSourceProducer:
+    """Get or create the multi-source producer instance."""
+    global multi_producer
+    if multi_producer is None:
+        bootstrap_servers = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092")
+        interval_ms = int(os.environ.get("EVENT_INTERVAL_MS", "500"))
+        user_id = os.environ.get("USER_ID", "user_001")
+        
+        multi_producer = MultiSourceProducer(
+            bootstrap_servers=bootstrap_servers,
+            user_id=user_id,
+            base_interval_ms=interval_ms,
+        )
+        set_multi_source_producer(multi_producer)
+    return multi_producer
+
+
+def get_legacy_producer() -> BiometricProducer:
+    """Get or create the legacy single-topic producer instance."""
+    global legacy_producer
+    if legacy_producer is None:
         bootstrap_servers = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092")
         topic = os.environ.get("KAFKA_TOPIC", "biometrics-raw")
         interval_ms = int(os.environ.get("EVENT_INTERVAL_MS", "500"))
         user_id = os.environ.get("USER_ID", "user_001")
         
-        producer = BiometricProducer(
+        legacy_producer = BiometricProducer(
             bootstrap_servers=bootstrap_servers,
             topic=topic,
             user_id=user_id,
             interval_ms=interval_ms,
         )
-    return producer
+    return legacy_producer
 
+
+# ============================================
+# Source Management Endpoints
+# ============================================
+
+@app.route('/sources', methods=['GET'])
+def list_sources():
+    """List all available data sources and their status."""
+    p = get_multi_producer()
+    sources = p.get_source_status()
+    
+    return jsonify({
+        "sources": list(sources.values()),
+        "total": len(sources),
+        "enabled_count": sum(1 for s in sources.values() if s["enabled"]),
+        "running": p.running
+    })
+
+
+@app.route('/sources/<source_id>', methods=['GET'])
+def get_source(source_id: str):
+    """Get status of a specific source."""
+    p = get_multi_producer()
+    sources = p.get_source_status()
+    
+    if source_id not in sources:
+        return jsonify({
+            "status": "error",
+            "message": f"Unknown source: {source_id}. Valid sources: {list(sources.keys())}"
+        }), 404
+    
+    return jsonify(sources[source_id])
+
+
+@app.route('/sources/<source_id>/enable', methods=['POST'])
+def enable_source(source_id: str):
+    """Enable a data source (start publishing to its topic)."""
+    p = get_multi_producer()
+    
+    if source_id not in SOURCE_CONFIGS:
+        return jsonify({
+            "status": "error",
+            "message": f"Unknown source: {source_id}. Valid sources: {list(SOURCE_CONFIGS.keys())}"
+        }), 404
+    
+    success = p.enable_source(source_id)
+    
+    if success:
+        return jsonify({
+            "status": "enabled",
+            "source_id": source_id,
+            "message": f"Source '{source_id}' is now enabled"
+        })
+    else:
+        return jsonify({
+            "status": "error",
+            "message": f"Failed to enable source: {source_id}"
+        }), 500
+
+
+@app.route('/sources/<source_id>/disable', methods=['POST'])
+def disable_source(source_id: str):
+    """Disable a data source (stop publishing to its topic)."""
+    p = get_multi_producer()
+    
+    if source_id not in SOURCE_CONFIGS:
+        return jsonify({
+            "status": "error",
+            "message": f"Unknown source: {source_id}. Valid sources: {list(SOURCE_CONFIGS.keys())}"
+        }), 404
+    
+    success = p.disable_source(source_id)
+    
+    if success:
+        return jsonify({
+            "status": "disabled",
+            "source_id": source_id,
+            "message": f"Source '{source_id}' is now disabled"
+        })
+    else:
+        return jsonify({
+            "status": "error",
+            "message": f"Failed to disable source: {source_id}"
+        }), 500
+
+
+# ============================================
+# Generator Control Endpoints
+# ============================================
 
 @app.route('/status', methods=['GET'])
 def get_status():
     """Get current generator status."""
-    p = get_producer()
+    p = get_multi_producer()
+    sources = p.get_source_status()
+    
     return jsonify({
         "running": p.running,
-        "events_generated": p.events_generated,
-        "anomaly_active": p.anomaly_active,
-        "anomaly_end_time": p.anomaly_end_time,
+        "mode": "multi-source",
         "user_id": p.user_id,
-        "topic": p.topic,
-        "interval_ms": p.interval_ms,
+        "interval_ms": p.base_interval_ms,
+        "anomaly_active": p.producer.anomaly_active,
+        "anomaly_end_time": p.producer.anomaly_end_time,
+        "sources": sources,
+        "total_events": sum(s["events_generated"] for s in sources.values()),
     })
 
 
 @app.route('/start', methods=['POST'])
 def start_generator():
-    """Start the data generator."""
+    """Start the multi-source data generator."""
     global producer_thread
     
     with producer_lock:
-        p = get_producer()
+        p = get_multi_producer()
         
         if p.running:
             return jsonify({
@@ -64,7 +182,7 @@ def start_generator():
             })
         
         # Connect if not connected
-        if not p.producer:
+        if not p.producer.producer:
             if not p.connect():
                 return jsonify({
                     "status": "error",
@@ -73,12 +191,14 @@ def start_generator():
         
         # Start in background thread
         p.running = True
-        producer_thread = threading.Thread(target=run_producer_loop, daemon=True)
+        p.producer.running = True
+        producer_thread = threading.Thread(target=run_multi_producer_loop, daemon=True)
         producer_thread.start()
         
         return jsonify({
             "status": "started",
-            "message": "Generator started successfully"
+            "message": "Multi-source generator started successfully",
+            "sources": list(p.get_source_status().keys())
         })
 
 
@@ -86,7 +206,7 @@ def start_generator():
 def stop_generator():
     """Stop the data generator."""
     with producer_lock:
-        p = get_producer()
+        p = get_multi_producer()
         
         if not p.running:
             return jsonify({
@@ -95,6 +215,7 @@ def stop_generator():
             })
         
         p.running = False
+        p.producer.running = False
         
         return jsonify({
             "status": "stopped",
@@ -104,8 +225,8 @@ def stop_generator():
 
 @app.route('/inject', methods=['POST'])
 def inject_anomaly():
-    """Inject an anomaly pattern."""
-    p = get_producer()
+    """Inject an anomaly pattern (affects all sources)."""
+    p = get_multi_producer()
     
     if not p.running:
         return jsonify({
@@ -125,14 +246,14 @@ def inject_anomaly():
             "message": f"Invalid anomaly type. Valid types: {list(ANOMALY_PATTERNS.keys())}"
         }), 400
     
-    # Inject anomaly
+    # Inject anomaly (affects all sources)
     p.inject_anomaly(anomaly_type, duration)
     
     return jsonify({
         "status": "injected",
         "anomaly_type": anomaly_type,
         "duration_seconds": duration,
-        "message": f"Anomaly '{anomaly_type}' injected for {duration} seconds"
+        "message": f"Anomaly '{anomaly_type}' injected for {duration} seconds (affects all sources)"
     })
 
 
@@ -146,17 +267,80 @@ def list_anomalies():
     })
 
 
-def run_producer_loop():
-    """Run the producer main loop in a thread."""
-    import time
-    p = get_producer()
-    interval_sec = p.interval_ms / 1000.0
+@app.route('/generate/historical', methods=['POST'])
+def generate_historical():
+    """
+    Generate historical biometric data for AI insights.
+    
+    Request body:
+    {
+        "days": 7,                    # Number of days of history (1-30)
+        "events_per_hour": 60,        # Events per hour (10-120)
+        "include_anomalies": true,    # Include random anomalies
+        "anomaly_probability": 0.05,  # Probability per event (0.0-0.2)
+        "pattern": "normal"           # normal|improving|declining|variable
+    }
+    
+    Returns the generated events for the API to insert into the database.
+    """
+    data = request.get_json() or {}
+    
+    # Extract and validate parameters
+    days = min(max(int(data.get('days', 7)), 1), 30)
+    events_per_hour = min(max(int(data.get('events_per_hour', 60)), 10), 120)
+    include_anomalies = bool(data.get('include_anomalies', True))
+    anomaly_probability = min(max(float(data.get('anomaly_probability', 0.05)), 0.0), 0.2)
+    pattern = data.get('pattern', 'normal')
+    
+    if pattern not in ['normal', 'improving', 'declining', 'variable']:
+        pattern = 'normal'
+    
+    user_id = os.environ.get("USER_ID", "user_001")
+    
+    try:
+        # Generate historical data
+        events = generate_historical_data(
+            user_id=user_id,
+            days=days,
+            events_per_hour=events_per_hour,
+            include_anomalies=include_anomalies,
+            anomaly_probability=anomaly_probability,
+            pattern=pattern
+        )
+        
+        return jsonify({
+            "status": "generated",
+            "events_count": len(events),
+            "days": days,
+            "pattern": pattern,
+            "events": events
+        })
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 500
+
+
+def run_multi_producer_loop():
+    """Run the multi-source producer main loop in a thread."""
+    p = get_multi_producer()
+    interval_sec = p.base_interval_ms / 1000.0
+    last_print_time = 0
     
     while p.running:
         try:
-            event = p.generate_event()
-            p.publish_event(event)
-            p.print_status(event)
+            p.generate_and_publish()
+            
+            # Print status every 5 seconds
+            current_time = time.time()
+            if current_time - last_print_time >= 5:
+                p.print_status()
+                last_print_time = current_time
+            
             time.sleep(interval_sec)
         except Exception as e:
             print(f"Error in producer loop: {e}")
@@ -171,4 +355,3 @@ def run_control_server(host='0.0.0.0', port=8001):
 
 if __name__ == '__main__':
     run_control_server()
-

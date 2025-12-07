@@ -1,16 +1,19 @@
 /**
  * Main Dashboard Component
  * Integrates all health monitoring components including Tier 2 & 3 features
+ * 
+ * All tab data is preloaded on mount to avoid loading delays when switching tabs.
+ * Components are rendered but hidden using CSS instead of conditional rendering.
  */
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { VitalChart } from './VitalChart';
 import { ThreatLog } from './ThreatLog';
 import { WellnessGauge } from './WellnessGauge';
 import { HealthChat } from './HealthChat';
 import { Timeline } from './Timeline';
-import { ControlPanel } from './ControlPanel';
+import { ControlModal } from './ControlModal';
 import { CorrelationInsights } from './CorrelationInsights';
 import { DailyDigest } from './DailyDigest';
 import { PredictiveInsights } from './PredictiveInsights';
@@ -27,20 +30,32 @@ import {
   Zap,
   Clock,
   TrendingUp,
-  MessageSquare,
   Settings,
   LayoutGrid,
   Brain,
-  Link2,
-  BarChart3,
-  Calendar,
-  X
+  Link2
 } from 'lucide-react';
 
 // API URLs from environment or defaults
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws/vitals';
 const CHAT_WS_URL = import.meta.env.VITE_CHAT_WS_URL || 'ws://localhost:8000/ws/chat';
+
+// Preload AI insights data on app startup
+const preloadData = async () => {
+  const endpoints = [
+    '/wellness/score',
+    '/correlations?hours=24',
+    '/predictions?max_hours=6',
+    '/digest/daily',
+    '/comparison/weekly'
+  ];
+  
+  // Fire all requests in parallel, don't wait for them
+  endpoints.forEach(endpoint => {
+    fetch(`${API_URL}${endpoint}`).catch(() => {});
+  });
+};
 
 function ConnectionStatus({ 
   status, 
@@ -108,14 +123,21 @@ function VitalIndicator({
   );
 }
 
-type ViewMode = 'dashboard' | 'insights' | 'integrations' | 'control';
+type ViewMode = 'dashboard' | 'insights' | 'integrations';
 
 export function Dashboard() {
   const { vitals, alerts, latestVital, connectionState, eventsPerSecond } = useWebSocket(100);
   const [viewMode, setViewMode] = useState<ViewMode>('dashboard');
-  const [showChat, setShowChat] = useState(true);
-  const [showDigest, setShowDigest] = useState(false);
-  const [showWeekComparison, setShowWeekComparison] = useState(false);
+  const [showControlModal, setShowControlModal] = useState(false);
+  const [dataPreloaded, setDataPreloaded] = useState(false);
+  
+  // Preload all data on mount for faster tab switching
+  useEffect(() => {
+    if (!dataPreloaded) {
+      preloadData();
+      setDataPreloaded(true);
+    }
+  }, [dataPreloaded]);
   
   const formatTime = () => {
     return new Date().toLocaleTimeString('en-US', {
@@ -185,20 +207,9 @@ export function Dashboard() {
                 Integrations
               </button>
               <button
-                onClick={() => setShowChat(!showChat)}
+                onClick={() => setShowControlModal(true)}
                 className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm transition-colors ${
-                  showChat
-                    ? 'bg-accent-purple/20 text-accent-purple'
-                    : 'text-soc-muted hover:text-soc-text'
-                }`}
-              >
-                <MessageSquare size={16} />
-                AI Coach
-              </button>
-              <button
-                onClick={() => setViewMode(viewMode === 'control' ? 'dashboard' : 'control')}
-                className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm transition-colors ${
-                  viewMode === 'control'
+                  showControlModal
                     ? 'bg-vital-warning/20 text-vital-warning'
                     : 'text-soc-muted hover:text-soc-text'
                 }`}
@@ -271,86 +282,55 @@ export function Dashboard() {
           />
         </div>
 
-        {/* Insights View */}
-        {viewMode === 'insights' && (
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
-            <div className="lg:col-span-1">
-              <DailyDigest apiUrl={API_URL} />
+        {/* AI Insights View - Full AI Features */}
+        <div className={viewMode === 'insights' ? '' : 'hidden'}>
+          <div className="space-y-6">
+            {/* Health Chat - Prominent at top */}
+            <div className="h-[400px]">
+              <HealthChat 
+                wsUrl={CHAT_WS_URL}
+                apiUrl={API_URL}
+              />
             </div>
-            <div className="lg:col-span-1">
-              <PredictiveInsights apiUrl={API_URL} />
+            
+            {/* AI Insights Grid */}
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+              <div className="lg:col-span-1">
+                <DailyDigest apiUrl={API_URL} />
+              </div>
+              <div className="lg:col-span-1">
+                <PredictiveInsights apiUrl={API_URL} />
+              </div>
+              <div className="lg:col-span-1">
+                <WeekComparison apiUrl={API_URL} />
+              </div>
             </div>
-            <div className="lg:col-span-1">
-              <WeekComparison apiUrl={API_URL} />
-            </div>
-            <div className="lg:col-span-3">
-              <CorrelationInsights apiUrl={API_URL} />
-            </div>
+            
+            {/* Correlation Insights - Full width */}
+            <CorrelationInsights apiUrl={API_URL} />
           </div>
-        )}
+        </div>
 
         {/* Integrations View */}
-        {viewMode === 'integrations' && (
-          <div className="mb-6">
-            <IntegrationDemo />
-          </div>
-        )}
+        <div className={viewMode === 'integrations' ? 'mb-6' : 'hidden'}>
+          <IntegrationDemo />
+        </div>
 
-        {/* Dashboard/Control View */}
-        {(viewMode === 'dashboard' || viewMode === 'control') && (
+        {/* Dashboard View - Clean Data Focus */}
+        <div className={viewMode === 'dashboard' ? '' : 'hidden'}>
           <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
-            {/* Left Column - Wellness Score & Insights */}
+            {/* Left Column - Wellness Score & Timeline */}
             <div className="lg:col-span-1 space-y-4">
               <WellnessGauge apiUrl={API_URL} />
               
-              {viewMode === 'control' && (
-                <ControlPanel apiUrl={API_URL} />
-              )}
+              {/* Only show correlations on dashboard if not on insights tab */}
+              {viewMode === 'dashboard' && <CorrelationInsights apiUrl={API_URL} />}
               
-              {/* Quick Actions */}
-              <div className="flex gap-2">
-                <button
-                  onClick={() => setShowDigest(!showDigest)}
-                  className={`flex-1 flex items-center justify-center gap-2 p-2 rounded-lg text-xs transition-colors ${
-                    showDigest
-                      ? 'bg-accent-cyan/20 text-accent-cyan border border-accent-cyan/30'
-                      : 'bg-soc-panel border border-soc-border text-soc-muted hover:text-soc-text'
-                  }`}
-                >
-                  <Calendar size={14} />
-                  Digest
-                </button>
-                <button
-                  onClick={() => setShowWeekComparison(!showWeekComparison)}
-                  className={`flex-1 flex items-center justify-center gap-2 p-2 rounded-lg text-xs transition-colors ${
-                    showWeekComparison
-                      ? 'bg-accent-purple/20 text-accent-purple border border-accent-purple/30'
-                      : 'bg-soc-panel border border-soc-border text-soc-muted hover:text-soc-text'
-                  }`}
-                >
-                  <BarChart3 size={14} />
-                  Weekly
-                </button>
-              </div>
-              
-              {showDigest && (
-                <DailyDigest apiUrl={API_URL} />
-              )}
-              
-              {showWeekComparison && (
-                <WeekComparison apiUrl={API_URL} />
-              )}
-              
-              {!showDigest && !showWeekComparison && (
-                <>
-                  <CorrelationInsights apiUrl={API_URL} />
-                  <Timeline 
-                    vitals={vitals}
-                    alerts={alerts}
-                    selectedMetric="heart_rate"
-                  />
-                </>
-              )}
+              <Timeline 
+                vitals={vitals}
+                alerts={alerts}
+                selectedMetric="heart_rate"
+              />
             </div>
 
             {/* Center Column - Charts */}
@@ -397,9 +377,6 @@ export function Dashboard() {
                 />
               </div>
 
-              {/* Predictive Insights (compact) */}
-              <PredictiveInsights apiUrl={API_URL} />
-
               {/* System Status Bar */}
               <div className="bg-soc-panel border border-soc-border rounded-lg p-4">
                 <div className="flex items-center justify-between text-sm">
@@ -424,23 +401,14 @@ export function Dashboard() {
               </div>
             </div>
 
-            {/* Right Column - Threat Log & Chat */}
-            <div className="lg:col-span-1 space-y-4">
-              {showChat ? (
-                <div className="h-[400px]">
-                  <HealthChat 
-                    wsUrl={CHAT_WS_URL}
-                    apiUrl={API_URL}
-                  />
-                </div>
-              ) : null}
-              
-              <div className={showChat ? 'h-[300px]' : 'h-[600px]'}>
+            {/* Right Column - Threat Log (Full height) */}
+            <div className="lg:col-span-1">
+              <div className="h-[700px]">
                 <ThreatLog alerts={alerts} />
               </div>
             </div>
           </div>
-        )}
+        </div>
       </main>
 
       {/* Footer */}
@@ -452,6 +420,13 @@ export function Dashboard() {
           </div>
         </div>
       </footer>
+
+      {/* Control Modal */}
+      <ControlModal 
+        apiUrl={API_URL}
+        isOpen={showControlModal}
+        onClose={() => setShowControlModal(false)}
+      />
     </div>
   );
 }

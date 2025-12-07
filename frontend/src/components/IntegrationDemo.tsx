@@ -1,17 +1,15 @@
 /**
  * Integration Demo Component
- * Mock OAuth flows and data normalization pipeline for health data sources
+ * Real integration with multi-source Kafka topics for health data sources
  */
 
-import { useState } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import {
   Link2,
   CheckCircle2,
-  Circle,
   ArrowRight,
   RefreshCw,
   Database,
-  Zap,
   Shield,
   Clock,
   Heart,
@@ -19,8 +17,13 @@ import {
   Moon,
   Watch,
   Smartphone,
-  X
+  X,
+  AlertCircle,
+  Loader2
 } from 'lucide-react';
+
+// API URL from environment
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
 interface DataSource {
   id: string;
@@ -28,23 +31,42 @@ interface DataSource {
   icon: string;
   color: string;
   connected: boolean;
+  enabled: boolean;
   lastSync: string | null;
+  eventsReceived: number;
   dataTypes: string[];
   sampleFields: Record<string, string>;
+  loading?: boolean;
 }
 
 interface IntegrationDemoProps {
   onClose?: () => void;
 }
 
-const DATA_SOURCES: DataSource[] = [
+// Map API source IDs to our display format
+const SOURCE_ID_MAP: Record<string, string> = {
+  'apple': 'apple_health',
+  'google': 'google_fit',
+  'oura': 'oura',
+};
+
+const REVERSE_SOURCE_ID_MAP: Record<string, string> = {
+  'apple_health': 'apple',
+  'google_fit': 'google',
+  'oura': 'oura',
+};
+
+// Initial source configurations (will be updated from API)
+const INITIAL_SOURCES: DataSource[] = [
   {
     id: 'apple_health',
     name: 'Apple HealthKit',
     icon: '🍎',
     color: '#FF3B30',
-    connected: false,
+    connected: true, // Default to connected
+    enabled: true,
     lastSync: null,
+    eventsReceived: 0,
     dataTypes: ['Heart Rate', 'HRV', 'Sleep', 'Steps', 'Workouts'],
     sampleFields: {
       'HKQuantityTypeIdentifierHeartRate': 'heart_rate',
@@ -58,8 +80,10 @@ const DATA_SOURCES: DataSource[] = [
     name: 'Google Fit',
     icon: '🏃',
     color: '#4285F4',
-    connected: false,
+    connected: true,
+    enabled: true,
     lastSync: null,
+    eventsReceived: 0,
     dataTypes: ['Heart Rate', 'Steps', 'Calories', 'Activity'],
     sampleFields: {
       'com.google.heart_rate.bpm': 'heart_rate',
@@ -73,8 +97,10 @@ const DATA_SOURCES: DataSource[] = [
     name: 'Oura Ring',
     icon: '💍',
     color: '#8B5CF6',
-    connected: false,
+    connected: true,
+    enabled: true,
     lastSync: null,
+    eventsReceived: 0,
     dataTypes: ['HRV', 'Sleep', 'Readiness', 'Temperature'],
     sampleFields: {
       'rmssd': 'hrv_ms',
@@ -95,12 +121,28 @@ function OAuthModal({
   onCancel: () => void;
 }) {
   const [connecting, setConnecting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const handleConnect = async () => {
     setConnecting(true);
-    // Simulate OAuth flow
-    await new Promise(resolve => setTimeout(resolve, 1500));
-    onConnect();
+    setError(null);
+    
+    try {
+      // Call the actual API to connect the source
+      const apiSourceId = REVERSE_SOURCE_ID_MAP[source.id] || source.id;
+      const response = await fetch(`${API_URL}/sources/${apiSourceId}/connect`, {
+        method: 'POST',
+      });
+      
+      if (!response.ok) {
+        throw new Error('Failed to connect source');
+      }
+      
+      onConnect();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Connection failed');
+      setConnecting(false);
+    }
   };
 
   return (
@@ -118,7 +160,7 @@ function OAuthModal({
             Connect {source.name}
           </h3>
           <p className="text-sm text-soc-muted mt-2">
-            Authorize Telara to access your health data
+            Enable real-time health data streaming via Kafka
           </p>
         </div>
 
@@ -139,12 +181,20 @@ function OAuthModal({
         <div className="flex items-start gap-3 p-3 bg-accent-cyan/10 rounded-lg mb-6">
           <Shield size={18} className="text-accent-cyan mt-0.5" />
           <div className="text-xs text-soc-muted">
-            <span className="text-accent-cyan font-medium">Secure Connection</span>
+            <span className="text-accent-cyan font-medium">Multi-Source Integration</span>
             <p className="mt-1">
-              Your data is encrypted and you can revoke access at any time.
+              Each source has its own Kafka topic for isolated, reliable data streaming.
             </p>
           </div>
         </div>
+
+        {/* Error message */}
+        {error && (
+          <div className="flex items-center gap-2 p-3 bg-vital-critical/10 border border-vital-critical/30 rounded-lg mb-4 text-xs text-vital-critical">
+            <AlertCircle size={16} />
+            {error}
+          </div>
+        )}
 
         {/* Actions */}
         <div className="flex gap-3">
@@ -182,7 +232,13 @@ function DataNormalizationView({ sources }: { sources: DataSource[] }) {
   const connectedSources = sources.filter(s => s.connected);
 
   if (connectedSources.length === 0) {
-    return null;
+    return (
+      <div className="mt-6 p-4 bg-soc-bg/50 rounded-lg border border-soc-border/50 text-center">
+        <p className="text-sm text-soc-muted">
+          Connect at least one source to see the data normalization pipeline.
+        </p>
+      </div>
+    );
   }
 
   return (
@@ -190,13 +246,16 @@ function DataNormalizationView({ sources }: { sources: DataSource[] }) {
       <div className="flex items-center gap-2 mb-4">
         <Database size={16} className="text-accent-purple" />
         <span className="text-sm font-medium text-soc-text">
-          Data Normalization Pipeline
+          Multi-Source Data Pipeline
+        </span>
+        <span className="text-xs text-vital-normal ml-auto">
+          {connectedSources.reduce((sum, s) => sum + s.eventsReceived, 0)} events processed
         </span>
       </div>
 
       {/* Pipeline visualization */}
       <div className="flex items-center gap-2 overflow-x-auto pb-2">
-        {/* Source nodes */}
+        {/* Source nodes with Kafka topics */}
         <div className="flex flex-col gap-1 flex-shrink-0">
           {connectedSources.map((source) => (
             <div 
@@ -206,12 +265,16 @@ function DataNormalizationView({ sources }: { sources: DataSource[] }) {
             >
               <span>{source.icon}</span>
               <span className="font-medium">{source.name}</span>
+              <span className="text-[10px] opacity-70">
+                ({source.eventsReceived})
+              </span>
             </div>
           ))}
         </div>
 
-        {/* Arrow */}
-        <div className="flex-shrink-0 flex items-center">
+        {/* Arrow with Kafka label */}
+        <div className="flex-shrink-0 flex flex-col items-center">
+          <div className="text-[9px] text-soc-muted mb-1">Kafka</div>
           <div className="w-8 h-px bg-soc-border" />
           <ArrowRight size={16} className="text-soc-muted" />
         </div>
@@ -224,7 +287,7 @@ function DataNormalizationView({ sources }: { sources: DataSource[] }) {
           <div className="text-[10px] text-soc-muted space-y-0.5">
             <div>• Unit conversion</div>
             <div>• Field mapping</div>
-            <div>• Deduplication</div>
+            <div>• Source attribution</div>
           </div>
         </div>
 
@@ -313,10 +376,13 @@ function SourceCard({
       <div className="flex items-center justify-between mb-3">
         <div className="flex items-center gap-3">
           <div 
-            className="w-10 h-10 rounded-lg flex items-center justify-center text-xl"
+            className="w-10 h-10 rounded-lg flex items-center justify-center text-xl relative"
             style={{ backgroundColor: `${source.color}20` }}
           >
             {source.icon}
+            {source.connected && (
+              <div className="absolute -bottom-1 -right-1 w-3 h-3 bg-vital-normal rounded-full border-2 border-soc-panel" />
+            )}
           </div>
           <div>
             <div className="font-medium text-soc-text">{source.name}</div>
@@ -326,7 +392,12 @@ function SourceCard({
           </div>
         </div>
         
-        {source.connected ? (
+        {source.loading ? (
+          <div className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-soc-muted">
+            <Loader2 size={14} className="animate-spin" />
+            Processing...
+          </div>
+        ) : source.connected ? (
           <button
             onClick={onDisconnect}
             className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-vital-normal bg-vital-normal/10 rounded-lg hover:bg-vital-normal/20 transition-colors"
@@ -345,10 +416,16 @@ function SourceCard({
         )}
       </div>
 
-      {source.connected && source.lastSync && (
-        <div className="flex items-center gap-1.5 text-xs text-soc-muted">
-          <Clock size={12} />
-          Last synced: {source.lastSync}
+      {source.connected && (
+        <div className="flex items-center justify-between text-xs text-soc-muted">
+          <div className="flex items-center gap-1.5">
+            <Clock size={12} />
+            {source.lastSync ? `Last: ${source.lastSync}` : 'Streaming...'}
+          </div>
+          <div className="flex items-center gap-1.5">
+            <Activity size={12} className="text-vital-normal" />
+            {source.eventsReceived.toLocaleString()} events
+          </div>
         </div>
       )}
     </div>
@@ -356,10 +433,56 @@ function SourceCard({
 }
 
 export function IntegrationDemo({ onClose }: IntegrationDemoProps) {
-  const [sources, setSources] = useState<DataSource[]>(DATA_SOURCES);
+  const [sources, setSources] = useState<DataSource[]>(INITIAL_SOURCES);
   const [connectingSource, setConnectingSource] = useState<DataSource | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
-  const handleConnect = (sourceId: string) => {
+  // Fetch initial source status from API
+  const fetchSourceStatus = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_URL}/sources`);
+      if (!response.ok) throw new Error('Failed to fetch sources');
+      
+      const data = await response.json();
+      
+      setSources(prev => prev.map(source => {
+        const apiSourceId = REVERSE_SOURCE_ID_MAP[source.id] || source.id;
+        const apiSource = data.sources?.find((s: any) => s.id === apiSourceId);
+        
+        if (apiSource) {
+          return {
+            ...source,
+            connected: apiSource.connected ?? apiSource.enabled ?? true,
+            enabled: apiSource.enabled ?? true,
+            eventsReceived: apiSource.events_received ?? 0,
+            lastSync: apiSource.last_event_time 
+              ? new Date(apiSource.last_event_time).toLocaleTimeString()
+              : null,
+          };
+        }
+        return source;
+      }));
+      
+      setError(null);
+    } catch (err) {
+      console.error('Error fetching sources:', err);
+      // Don't show error on initial load - sources default to connected
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  // Initial fetch and periodic refresh
+  useEffect(() => {
+    fetchSourceStatus();
+    
+    // Refresh every 5 seconds
+    const interval = setInterval(fetchSourceStatus, 5000);
+    return () => clearInterval(interval);
+  }, [fetchSourceStatus]);
+
+  const handleConnect = async (sourceId: string) => {
     setSources(prev => prev.map(s => 
       s.id === sourceId 
         ? { ...s, connected: true, lastSync: 'Just now' }
@@ -368,15 +491,35 @@ export function IntegrationDemo({ onClose }: IntegrationDemoProps) {
     setConnectingSource(null);
   };
 
-  const handleDisconnect = (sourceId: string) => {
+  const handleDisconnect = async (sourceId: string) => {
+    // Set loading state
     setSources(prev => prev.map(s =>
-      s.id === sourceId
-        ? { ...s, connected: false, lastSync: null }
-        : s
+      s.id === sourceId ? { ...s, loading: true } : s
     ));
+    
+    try {
+      const apiSourceId = REVERSE_SOURCE_ID_MAP[sourceId] || sourceId;
+      const response = await fetch(`${API_URL}/sources/${apiSourceId}/disconnect`, {
+        method: 'POST',
+      });
+      
+      if (!response.ok) throw new Error('Failed to disconnect');
+      
+      setSources(prev => prev.map(s =>
+        s.id === sourceId
+          ? { ...s, connected: false, lastSync: null, loading: false }
+          : s
+      ));
+    } catch (err) {
+      console.error('Error disconnecting source:', err);
+      setSources(prev => prev.map(s =>
+        s.id === sourceId ? { ...s, loading: false } : s
+      ));
+    }
   };
 
   const connectedCount = sources.filter(s => s.connected).length;
+  const totalEvents = sources.reduce((sum, s) => sum + s.eventsReceived, 0);
 
   return (
     <div className="bg-soc-panel border border-soc-border rounded-lg overflow-hidden">
@@ -386,13 +529,18 @@ export function IntegrationDemo({ onClose }: IntegrationDemoProps) {
           <div className="flex items-center gap-2">
             <Link2 size={18} className="text-accent-purple" />
             <h3 className="text-sm font-medium text-soc-text">
-              Data Source Integrations
+              Multi-Source Integrations
             </h3>
           </div>
           <div className="flex items-center gap-3">
             <span className="text-xs text-soc-muted">
               {connectedCount} of {sources.length} connected
             </span>
+            {totalEvents > 0 && (
+              <span className="text-xs text-vital-normal">
+                {totalEvents.toLocaleString()} events
+              </span>
+            )}
             {onClose && (
               <button
                 onClick={onClose}
@@ -410,36 +558,44 @@ export function IntegrationDemo({ onClose }: IntegrationDemoProps) {
         <div className="flex items-start gap-3 p-3 bg-accent-cyan/10 border border-accent-cyan/30 rounded-lg mb-4">
           <Smartphone size={18} className="text-accent-cyan mt-0.5" />
           <div className="text-xs">
-            <span className="text-accent-cyan font-medium">Multi-Source Health Data</span>
+            <span className="text-accent-cyan font-medium">Multi-Source Kafka Architecture</span>
             <p className="text-soc-muted mt-1">
-              Connect your health devices and apps to unify all your biometric data in one place.
-              Telara normalizes data from different sources into a unified schema for AI analysis.
+              Each health data source streams to its own Kafka topic for isolated, 
+              reliable data ingestion. Data is normalized into a unified schema for AI analysis.
             </p>
           </div>
         </div>
 
-        {/* Source cards */}
-        <div className="space-y-3">
-          {sources.map((source) => (
-            <SourceCard
-              key={source.id}
-              source={source}
-              onConnect={() => setConnectingSource(source)}
-              onDisconnect={() => handleDisconnect(source.id)}
-            />
-          ))}
-        </div>
+        {/* Loading state */}
+        {loading ? (
+          <div className="flex items-center justify-center py-8">
+            <Loader2 size={24} className="animate-spin text-accent-cyan" />
+          </div>
+        ) : (
+          <>
+            {/* Source cards */}
+            <div className="space-y-3">
+              {sources.map((source) => (
+                <SourceCard
+                  key={source.id}
+                  source={source}
+                  onConnect={() => setConnectingSource(source)}
+                  onDisconnect={() => handleDisconnect(source.id)}
+                />
+              ))}
+            </div>
 
-        {/* Normalization pipeline */}
-        <DataNormalizationView sources={sources} />
+            {/* Normalization pipeline */}
+            <DataNormalizationView sources={sources} />
+          </>
+        )}
 
         {/* Architecture note */}
         <div className="mt-4 p-3 bg-soc-bg/30 rounded-lg border border-soc-border/30">
           <div className="flex items-center gap-2 text-xs text-soc-muted">
             <Watch size={14} className="text-accent-purple" />
             <span>
-              Demo mode: In production, this would integrate with real OAuth2 flows 
-              and streaming data pipelines.
+              <strong>Kafka Topics:</strong> biometrics-apple, biometrics-google, biometrics-oura
             </span>
           </div>
         </div>
@@ -456,4 +612,3 @@ export function IntegrationDemo({ onClose }: IntegrationDemoProps) {
     </div>
   );
 }
-

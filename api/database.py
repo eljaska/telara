@@ -13,12 +13,20 @@ import os
 
 DATABASE_PATH = os.environ.get("DATABASE_PATH", "/app/data/telara.db")
 
+# Global connection pool settings
+_db_lock = asyncio.Lock()
+
 
 async def init_database():
     """Initialize the database with required tables."""
     os.makedirs(os.path.dirname(DATABASE_PATH), exist_ok=True)
     
-    async with aiosqlite.connect(DATABASE_PATH) as db:
+    async with aiosqlite.connect(DATABASE_PATH, timeout=30.0) as db:
+        # Enable WAL mode for better concurrent access
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute("PRAGMA synchronous=NORMAL")
+        await db.execute("PRAGMA busy_timeout=30000")
+        
         # Vitals table - stores recent biometric data
         await db.execute("""
             CREATE TABLE IF NOT EXISTS vitals (
@@ -80,6 +88,24 @@ async def init_database():
             )
         """)
         
+        # Migration: Add missing columns to user_baselines if they don't exist
+        try:
+            await db.execute("ALTER TABLE user_baselines ADD COLUMN std_heart_rate REAL DEFAULT 0")
+        except:
+            pass  # Column already exists
+        try:
+            await db.execute("ALTER TABLE user_baselines ADD COLUMN std_hrv REAL DEFAULT 0")
+        except:
+            pass
+        try:
+            await db.execute("ALTER TABLE user_baselines ADD COLUMN std_spo2 REAL DEFAULT 0")
+        except:
+            pass
+        try:
+            await db.execute("ALTER TABLE user_baselines ADD COLUMN std_temp REAL DEFAULT 0")
+        except:
+            pass
+        
         # Create indexes for faster queries
         await db.execute("CREATE INDEX IF NOT EXISTS idx_vitals_timestamp ON vitals(timestamp)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_vitals_user ON vitals(user_id)")
@@ -87,13 +113,14 @@ async def init_database():
         await db.execute("CREATE INDEX IF NOT EXISTS idx_alerts_severity ON alerts(severity)")
         
         await db.commit()
-        print("✓ Database initialized successfully")
+        print("✓ Database initialized successfully (WAL mode enabled)")
 
 
 @asynccontextmanager
 async def get_db():
-    """Get database connection context manager."""
-    db = await aiosqlite.connect(DATABASE_PATH)
+    """Get database connection context manager with proper settings."""
+    db = await aiosqlite.connect(DATABASE_PATH, timeout=30.0)
+    await db.execute("PRAGMA busy_timeout=30000")
     db.row_factory = aiosqlite.Row
     try:
         yield db
@@ -211,6 +238,97 @@ class VitalsRepository:
             cutoff = datetime.utcnow() - timedelta(hours=hours)
             await db.execute("DELETE FROM vitals WHERE timestamp < ?", (cutoff.isoformat(),))
             await db.commit()
+    
+    @staticmethod
+    async def bulk_insert_vitals(vitals_list: List[Dict[str, Any]], batch_size: int = 1000) -> Dict[str, Any]:
+        """
+        Efficiently insert a large batch of historical vitals into the database.
+        Uses executemany for better performance and less locking.
+        
+        Args:
+            vitals_list: List of vital event dictionaries
+            batch_size: Number of records per batch commit
+        
+        Returns:
+            Dict with insertion statistics
+        """
+        if not vitals_list:
+            return {"success": True, "inserted": 0, "failed": 0, "total": 0}
+        
+        inserted = 0
+        failed = 0
+        
+        try:
+            # Use a single connection with WAL mode for the entire operation
+            async with aiosqlite.connect(DATABASE_PATH, timeout=60.0) as db:
+                await db.execute("PRAGMA journal_mode=WAL")
+                await db.execute("PRAGMA synchronous=OFF")  # Faster for bulk inserts
+                await db.execute("PRAGMA cache_size=10000")
+                
+                # Prepare data tuples for executemany
+                for i in range(0, len(vitals_list), batch_size):
+                    batch = vitals_list[i:i + batch_size]
+                    
+                    data_tuples = []
+                    for vital_data in batch:
+                        data_tuples.append((
+                            vital_data.get("event_id"),
+                            vital_data.get("timestamp"),
+                            vital_data.get("user_id"),
+                            vital_data.get("heart_rate"),
+                            vital_data.get("hrv_ms"),
+                            vital_data.get("spo2_percent"),
+                            vital_data.get("skin_temp_c"),
+                            vital_data.get("respiratory_rate"),
+                            vital_data.get("activity_level"),
+                            vital_data.get("steps_per_minute"),
+                            vital_data.get("calories_per_minute"),
+                            vital_data.get("posture"),
+                            vital_data.get("hours_last_night"),
+                            vital_data.get("room_temp_c"),
+                            vital_data.get("humidity_percent"),
+                        ))
+                    
+                    try:
+                        await db.executemany("""
+                            INSERT OR REPLACE INTO vitals (
+                                event_id, timestamp, user_id, heart_rate, hrv_ms,
+                                spo2_percent, skin_temp_c, respiratory_rate,
+                                activity_level, steps_per_minute, calories_per_minute,
+                                posture, sleep_hours, room_temp_c, humidity_percent
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, data_tuples)
+                        inserted += len(data_tuples)
+                    except Exception as e:
+                        print(f"Error in batch insert: {e}")
+                        failed += len(data_tuples)
+                    
+                    # Commit after each batch to release locks
+                    await db.commit()
+                    
+                    # Small yield to allow other operations
+                    await asyncio.sleep(0.01)
+                    
+                    print(f"  Inserted batch {i // batch_size + 1}: {min(i + batch_size, len(vitals_list))}/{len(vitals_list)}")
+                
+                # Final commit
+                await db.commit()
+                
+            return {
+                "success": True,
+                "inserted": inserted,
+                "failed": failed,
+                "total": len(vitals_list)
+            }
+        except Exception as e:
+            print(f"Error in bulk insert: {e}")
+            return {
+                "success": False,
+                "inserted": inserted,
+                "failed": failed,
+                "total": len(vitals_list),
+                "error": str(e)
+            }
 
 
 class AlertsRepository:
@@ -406,19 +524,22 @@ class BaselinesRepository:
                 activity = vital_data.get("activity_level")
                 
                 if existing:
+                    # Convert Row to dict for easier access
+                    existing_dict = dict(existing)
+                    
                     # EMA update: new_avg = alpha * new_value + (1 - alpha) * old_avg
-                    new_hr = alpha * hr + (1 - alpha) * existing["avg_heart_rate"] if hr else existing["avg_heart_rate"]
-                    new_hrv = alpha * hrv + (1 - alpha) * existing["avg_hrv"] if hrv else existing["avg_hrv"]
-                    new_spo2 = alpha * spo2 + (1 - alpha) * existing["avg_spo2"] if spo2 else existing["avg_spo2"]
-                    new_temp = alpha * temp + (1 - alpha) * existing["avg_temp"] if temp else existing["avg_temp"]
-                    new_activity = alpha * activity + (1 - alpha) * existing["avg_activity"] if activity else existing["avg_activity"]
+                    new_hr = alpha * hr + (1 - alpha) * existing_dict["avg_heart_rate"] if hr else existing_dict["avg_heart_rate"]
+                    new_hrv = alpha * hrv + (1 - alpha) * existing_dict["avg_hrv"] if hrv else existing_dict["avg_hrv"]
+                    new_spo2 = alpha * spo2 + (1 - alpha) * existing_dict["avg_spo2"] if spo2 else existing_dict["avg_spo2"]
+                    new_temp = alpha * temp + (1 - alpha) * existing_dict["avg_temp"] if temp else existing_dict["avg_temp"]
+                    new_activity = alpha * activity + (1 - alpha) * existing_dict["avg_activity"] if activity else existing_dict["avg_activity"]
                     
                     # Update variance estimates using Welford's online algorithm (simplified)
-                    n = existing["data_points"] + 1
-                    old_std_hr = existing.get("std_heart_rate") or 0
-                    old_std_hrv = existing.get("std_hrv") or 0
-                    old_std_spo2 = existing.get("std_spo2") or 0
-                    old_std_temp = existing.get("std_temp") or 0
+                    n = existing_dict["data_points"] + 1
+                    old_std_hr = existing_dict.get("std_heart_rate") or 0
+                    old_std_hrv = existing_dict.get("std_hrv") or 0
+                    old_std_spo2 = existing_dict.get("std_spo2") or 0
+                    old_std_temp = existing_dict.get("std_temp") or 0
                     
                     # Simple running std estimate
                     new_std_hr = ((1 - alpha) * old_std_hr**2 + alpha * (hr - new_hr)**2)**0.5 if hr else old_std_hr

@@ -298,9 +298,17 @@ Return ONLY the 3 observations, one per line, no numbering or bullets."""
         yesterday_start = now - timedelta(hours=48)
         yesterday_end = now - timedelta(hours=24)
         
+        def parse_timestamp_naive(ts: str) -> datetime:
+            """Parse timestamp and strip timezone info for comparison."""
+            dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+            # Convert to naive UTC for comparison
+            if dt.tzinfo is not None:
+                dt = dt.replace(tzinfo=None)
+            return dt
+        
         yesterday_filtered = [
             v for v in yesterday_vitals
-            if yesterday_start <= datetime.fromisoformat(v["timestamp"]) <= yesterday_end
+            if yesterday_start <= parse_timestamp_naive(v["timestamp"]) <= yesterday_end
         ]
         
         # Calculate yesterday's stats manually

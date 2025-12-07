@@ -18,7 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from kafka_consumer import KafkaStreamConsumer, MessageBuffer
+from kafka_consumer import MultiSourceKafkaConsumer, MessageBuffer, SOURCE_CONFIGS
 from database import (
     init_database,
     VitalsRepository,
@@ -163,7 +163,7 @@ class ConnectionManager:
 
 # Global instances
 manager = ConnectionManager()
-kafka_consumer: KafkaStreamConsumer = None
+kafka_consumer: MultiSourceKafkaConsumer = None
 
 
 @asynccontextmanager
@@ -174,28 +174,28 @@ async def lifespan(app: FastAPI):
     print("=" * 60)
     print("TELARA API SERVER STARTING")
     print(f"  Kafka: {KAFKA_BOOTSTRAP_SERVERS}")
-    print(f"  Raw Topic: {KAFKA_RAW_TOPIC}")
+    print(f"  Multi-Source Mode: Enabled")
+    print(f"  Sources: Apple, Google, Oura")
     print(f"  Alerts Topic: {KAFKA_ALERTS_TOPIC}")
     print("=" * 60)
     
     # Initialize database
     await init_database()
     
-    # Initialize Kafka consumer
-    kafka_consumer = KafkaStreamConsumer(
+    # Initialize multi-source Kafka consumer
+    kafka_consumer = MultiSourceKafkaConsumer(
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-        raw_topic=KAFKA_RAW_TOPIC,
         alerts_topic=KAFKA_ALERTS_TOPIC,
     )
     
     # Register broadcast callback
     kafka_consumer.register_callback(manager.broadcast)
     
-    # Start consuming
+    # Start consuming from all source topics
     loop = asyncio.get_event_loop()
     await kafka_consumer.start(loop)
     
-    print("✓ Telara API Server ready")
+    print("✓ Telara API Server ready (multi-source mode)")
     
     yield
     
@@ -251,6 +251,8 @@ async def health_check():
 @app.get("/stats")
 async def get_stats():
     """Get streaming statistics."""
+    source_status = kafka_consumer.get_source_status() if kafka_consumer else {}
+    
     return {
         "vitals_processed": manager.stats["total_vitals"],
         "alerts_generated": manager.stats["total_alerts"],
@@ -259,6 +261,13 @@ async def get_stats():
         "buffer": {
             "vitals_buffered": len(manager.message_buffer.vitals),
             "alerts_buffered": len(manager.message_buffer.alerts),
+        },
+        "sources": {
+            source_id: {
+                "connected": s.get("connected", False),
+                "events_received": s.get("events_received", 0),
+            }
+            for source_id, s in source_status.items()
         }
     }
 
@@ -520,6 +529,239 @@ async def inject_anomaly(anomaly_type: str, duration: int = Query(default=30, le
             return response.json()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+class HistoricalDataRequest(BaseModel):
+    days: int = 7
+    events_per_hour: int = 60  # Reduced default for faster generation
+    include_anomalies: bool = True
+    anomaly_probability: float = 0.05
+    pattern: str = "normal"
+
+
+@app.post("/generator/historical")
+async def generate_historical_data(request: HistoricalDataRequest):
+    """
+    Generate historical biometric data for AI insights (daily digest, weekly comparison).
+    
+    This endpoint proxies to the data generator to create backdated events,
+    then bulk inserts them into the database for immediate availability.
+    """
+    try:
+        # Request historical data from generator with increased timeout
+        async with httpx.AsyncClient(timeout=600.0) as client:
+            response = await client.post(
+                f"{GENERATOR_CONTROL_URL}/generate/historical",
+                json={
+                    "days": request.days,
+                    "events_per_hour": request.events_per_hour,
+                    "include_anomalies": request.include_anomalies,
+                    "anomaly_probability": request.anomaly_probability,
+                    "pattern": request.pattern
+                }
+            )
+            
+            if response.status_code != 200:
+                raise HTTPException(status_code=response.status_code, detail="Generator error")
+            
+            data = response.json()
+            
+            if data.get("status") != "generated":
+                raise HTTPException(status_code=500, detail=data.get("message", "Generation failed"))
+            
+            # Bulk insert events into database
+            events = data.get("events", [])
+            
+            if not events:
+                return {
+                    "status": "success",
+                    "message": "No events generated",
+                    "inserted": 0
+                }
+            
+            # Bulk insert without updating baselines during insert (avoids locks)
+            result = await VitalsRepository.bulk_insert_vitals(events)
+            
+            return {
+                "status": "success",
+                "message": f"Generated and inserted {result.get('inserted', 0)} historical events",
+                "days": request.days,
+                "pattern": request.pattern,
+                "inserted": result.get("inserted", 0),
+                "failed": result.get("failed", 0)
+            }
+            
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Generator timeout - try fewer days or events_per_hour")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==============================================================================
+# REST Endpoints - Source Management (Multi-Source Integration)
+# ==============================================================================
+
+@app.get("/sources")
+async def list_sources():
+    """
+    List all available data sources and their connection status.
+    Returns status for Apple HealthKit, Google Fit, and Oura Ring.
+    """
+    # Get consumer-side status
+    consumer_status = kafka_consumer.get_source_status() if kafka_consumer else {}
+    
+    # Get generator-side status
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(f"{GENERATOR_CONTROL_URL}/sources")
+            generator_status = response.json() if response.status_code == 200 else {}
+    except:
+        generator_status = {}
+    
+    # Merge statuses
+    sources = []
+    for source_id, config in SOURCE_CONFIGS.items():
+        consumer_source = consumer_status.get(source_id, {})
+        generator_source = generator_status.get("sources", {})
+        gen_info = next((s for s in generator_source if isinstance(generator_source, list) and s.get("id") == source_id), {}) if isinstance(generator_source, list) else {}
+        
+        sources.append({
+            "id": source_id,
+            "name": config["name"],
+            "icon": config["icon"],
+            "color": config["color"],
+            "topic": config["topic"],
+            "connected": consumer_source.get("connected", True),
+            "enabled": consumer_source.get("enabled", True),
+            "events_received": consumer_source.get("events_received", 0),
+            "last_event_time": consumer_source.get("last_event_time"),
+            "data_types": gen_info.get("data_types", []),
+        })
+    
+    return {
+        "sources": sources,
+        "total": len(sources),
+        "connected_count": sum(1 for s in sources if s["connected"]),
+    }
+
+
+@app.get("/sources/{source_id}")
+async def get_source_status(source_id: str):
+    """Get detailed status for a specific data source."""
+    if source_id not in SOURCE_CONFIGS:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown source: {source_id}. Valid sources: {list(SOURCE_CONFIGS.keys())}"
+        )
+    
+    consumer_status = kafka_consumer.get_source_status() if kafka_consumer else {}
+    source = consumer_status.get(source_id, {})
+    
+    return {
+        "id": source_id,
+        "name": SOURCE_CONFIGS[source_id]["name"],
+        "icon": SOURCE_CONFIGS[source_id]["icon"],
+        "color": SOURCE_CONFIGS[source_id]["color"],
+        "topic": SOURCE_CONFIGS[source_id]["topic"],
+        "connected": source.get("connected", True),
+        "enabled": source.get("enabled", True),
+        "events_received": source.get("events_received", 0),
+        "last_event_time": source.get("last_event_time"),
+    }
+
+
+@app.post("/sources/{source_id}/connect")
+async def connect_source(source_id: str):
+    """
+    Connect/enable a data source.
+    This enables both consuming from the topic and tells the generator to produce.
+    """
+    if source_id not in SOURCE_CONFIGS:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown source: {source_id}. Valid sources: {list(SOURCE_CONFIGS.keys())}"
+        )
+    
+    # Enable on consumer side
+    if kafka_consumer:
+        kafka_consumer.enable_source(source_id)
+    
+    # Enable on generator side
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.post(f"{GENERATOR_CONTROL_URL}/sources/{source_id}/enable")
+            generator_result = response.json() if response.status_code == 200 else {"status": "unknown"}
+    except Exception as e:
+        generator_result = {"status": "error", "message": str(e)}
+    
+    return {
+        "status": "connected",
+        "source_id": source_id,
+        "source_name": SOURCE_CONFIGS[source_id]["name"],
+        "message": f"Source '{source_id}' is now connected",
+        "generator_status": generator_result.get("status", "unknown")
+    }
+
+
+@app.post("/sources/{source_id}/disconnect")
+async def disconnect_source(source_id: str):
+    """
+    Disconnect/disable a data source.
+    This stops consuming from the topic and tells the generator to stop producing.
+    """
+    if source_id not in SOURCE_CONFIGS:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown source: {source_id}. Valid sources: {list(SOURCE_CONFIGS.keys())}"
+        )
+    
+    # Disable on consumer side
+    if kafka_consumer:
+        kafka_consumer.disable_source(source_id)
+    
+    # Disable on generator side
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.post(f"{GENERATOR_CONTROL_URL}/sources/{source_id}/disable")
+            generator_result = response.json() if response.status_code == 200 else {"status": "unknown"}
+    except Exception as e:
+        generator_result = {"status": "error", "message": str(e)}
+    
+    return {
+        "status": "disconnected",
+        "source_id": source_id,
+        "source_name": SOURCE_CONFIGS[source_id]["name"],
+        "message": f"Source '{source_id}' is now disconnected",
+        "generator_status": generator_result.get("status", "unknown")
+    }
+
+
+@app.get("/sources/stats/summary")
+async def get_source_stats_summary():
+    """Get aggregated statistics across all sources."""
+    if not kafka_consumer:
+        return {"error": "Consumer not initialized"}
+    
+    status = kafka_consumer.get_source_status()
+    buffer_stats = manager.message_buffer.get_source_stats()
+    
+    total_events = sum(s.get("events_received", 0) for s in status.values())
+    connected_count = sum(1 for s in status.values() if s.get("connected", False))
+    
+    return {
+        "total_events": total_events,
+        "connected_sources": connected_count,
+        "total_sources": len(status),
+        "per_source": {
+            source_id: {
+                "events_received": s.get("events_received", 0),
+                "connected": s.get("connected", False),
+                "last_event_time": s.get("last_event_time"),
+            }
+            for source_id, s in status.items()
+        },
+        "buffer_stats": buffer_stats,
+    }
 
 
 # ==============================================================================
