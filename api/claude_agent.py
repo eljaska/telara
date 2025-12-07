@@ -246,9 +246,9 @@ class HealthCoachAgent:
                     "activity_level": latest.get("activity_level")
                 },
                 "summary": {
-                    "avg_heart_rate": round(sum(v["heart_rate"] for v in vitals if v.get("heart_rate")) / len(vitals), 1),
-                    "avg_hrv": round(sum(v["hrv_ms"] for v in vitals if v.get("hrv_ms")) / len(vitals), 1),
-                    "avg_spo2": round(sum(v["spo2_percent"] for v in vitals if v.get("spo2_percent")) / len(vitals), 1),
+                    "avg_heart_rate": round(sum(hr_vals) / len(hr_vals), 1) if (hr_vals := [v["heart_rate"] for v in vitals if v.get("heart_rate")]) else None,
+                    "avg_hrv": round(sum(hrv_vals) / len(hrv_vals), 1) if (hrv_vals := [v["hrv_ms"] for v in vitals if v.get("hrv_ms")]) else None,
+                    "avg_spo2": round(sum(spo2_vals) / len(spo2_vals), 1) if (spo2_vals := [v["spo2_percent"] for v in vitals if v.get("spo2_percent")]) else None,
                 }
             }
         
@@ -446,8 +446,8 @@ class HealthCoachAgent:
             "alert": alert_data,
             "recent_vitals_summary": {
                 "count": len(vitals),
-                "avg_hr": round(sum(v["heart_rate"] for v in vitals if v.get("heart_rate")) / len(vitals), 1) if vitals else None,
-                "avg_hrv": round(sum(v["hrv_ms"] for v in vitals if v.get("hrv_ms")) / len(vitals), 1) if vitals else None,
+                "avg_hr": round(sum(hr_vals) / len(hr_vals), 1) if (hr_vals := [v["heart_rate"] for v in vitals if v.get("heart_rate")]) else None,
+                "avg_hrv": round(sum(hrv_vals) / len(hrv_vals), 1) if (hrv_vals := [v["hrv_ms"] for v in vitals if v.get("hrv_ms")]) else None,
             } if vitals else None,
             "baseline": baseline
         }
