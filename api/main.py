@@ -65,6 +65,13 @@ class ConnectionManager:
             "total_alerts": 0,
             "connections_total": 0,
         }
+        
+        # Write buffer for batching database operations
+        self._write_buffer: list = []
+        self._write_lock = asyncio.Lock()
+        self._flush_task: Optional[asyncio.Task] = None
+        self._flush_interval = 2.0  # Flush every 2 seconds
+        self._max_buffer_size = 50  # Or when buffer reaches 50 items
     
     async def connect(self, websocket: WebSocket):
         """Accept and register a new WebSocket connection."""
@@ -93,49 +100,106 @@ class ConnectionManager:
         self.chat_connections.pop(session_id, None)
     
     async def broadcast(self, message: dict):
-        """Broadcast a message to all connected clients."""
-        if not self.active_connections:
-            return
-        
-        # Update buffer
+        """Broadcast a message to all connected clients (non-blocking)."""
+        # Update buffer (synchronous, fast)
         self.message_buffer.add_message(message)
         
-        # Store to database
-        await self._store_message(message)
-        
-        # Update stats
+        # Update stats (synchronous, fast)
         if message["type"] == "vital":
             self.stats["total_vitals"] += 1
         elif message["type"] == "alert":
             self.stats["total_alerts"] += 1
-            # Enrich alert with AI insight
+            # Enrich alert with AI insight (async, non-blocking)
             asyncio.create_task(self._enrich_alert(message["data"]))
         
-        # Broadcast to all connections
-        disconnected = set()
+        # Store to database (non-blocking, runs in background)
+        asyncio.create_task(self._store_message(message))
         
-        for connection in self.active_connections:
+        if not self.active_connections:
+            return
+        
+        # Broadcast to all connections in parallel (don't wait for slow clients)
+        async def safe_send(ws: WebSocket) -> WebSocket | None:
             try:
-                await connection.send_json(message)
+                await asyncio.wait_for(ws.send_json(message), timeout=1.0)
+                return None
             except Exception:
-                disconnected.add(connection)
+                return ws
         
-        # Clean up disconnected clients
-        for conn in disconnected:
-            self.active_connections.discard(conn)
+        # Send to all clients concurrently with timeout
+        results = await asyncio.gather(
+            *[safe_send(conn) for conn in self.active_connections],
+            return_exceptions=True
+        )
+        
+        # Clean up disconnected/slow clients
+        for result in results:
+            if isinstance(result, WebSocket):
+                self.active_connections.discard(result)
+    
+    def start_flush_loop(self):
+        """Start the background flush loop for batched database writes."""
+        if self._flush_task is None or self._flush_task.done():
+            self._flush_task = asyncio.create_task(self._flush_loop())
+    
+    async def _flush_loop(self):
+        """Background loop that periodically flushes the write buffer."""
+        while True:
+            try:
+                await asyncio.sleep(self._flush_interval)
+                await self._flush_write_buffer()
+            except asyncio.CancelledError:
+                # Final flush on shutdown
+                await self._flush_write_buffer()
+                break
+            except Exception as e:
+                print(f"Error in flush loop: {e}")
+    
+    async def _flush_write_buffer(self):
+        """Flush accumulated messages to database in a batch."""
+        async with self._write_lock:
+            if not self._write_buffer:
+                return
+            
+            # Grab all messages and clear buffer
+            messages = self._write_buffer.copy()
+            self._write_buffer.clear()
+        
+        # Separate vitals and alerts
+        vitals = [m["data"] for m in messages if m["type"] == "vital"]
+        alerts = [m["data"] for m in messages if m["type"] == "alert"]
+        
+        # Batch insert vitals
+        if vitals:
+            try:
+                await VitalsRepository.bulk_insert_vitals(vitals)
+            except Exception as e:
+                print(f"Error batch inserting vitals: {e}")
+        
+        # Insert alerts individually (usually few)
+        for alert in alerts:
+            try:
+                await AlertsRepository.insert(alert)
+            except Exception as e:
+                print(f"Error inserting alert: {e}")
+        
+        # Update baseline with last vital (occasional)
+        if vitals and len(vitals) > 0:
+            try:
+                user_id = vitals[-1].get("user_id", "user_001")
+                await BaselinesRepository.auto_update_baseline(user_id, vitals[-1])
+            except Exception as e:
+                print(f"Error updating baseline: {e}")
     
     async def _store_message(self, message: dict):
-        """Store message to database and update baselines."""
-        try:
-            if message["type"] == "vital":
-                await VitalsRepository.insert(message["data"])
-                # Auto-update user baseline with each vital reading
-                user_id = message["data"].get("user_id", "user_001")
-                await BaselinesRepository.auto_update_baseline(user_id, message["data"])
-            elif message["type"] == "alert":
-                await AlertsRepository.insert(message["data"])
-        except Exception as e:
-            print(f"Error storing message: {e}")
+        """Queue message for batched database storage."""
+        async with self._write_lock:
+            self._write_buffer.append(message)
+            
+            # Force flush if buffer is full
+            if len(self._write_buffer) >= self._max_buffer_size:
+                # Schedule immediate flush
+                asyncio.create_task(self._flush_write_buffer())
     
     async def _enrich_alert(self, alert_data: dict):
         """Enrich alert with AI-generated insight."""
@@ -194,6 +258,9 @@ async def lifespan(app: FastAPI):
     # Start consuming from all source topics
     loop = asyncio.get_event_loop()
     await kafka_consumer.start(loop)
+    
+    # Start the database write buffer flush loop
+    manager.start_flush_loop()
     
     print("✓ Telara API Server ready (multi-source mode)")
     
