@@ -23,7 +23,10 @@ from database import (
     init_database,
     VitalsRepository,
     AlertsRepository,
-    BaselinesRepository
+    BaselinesRepository,
+    vitals_store,   # Speed Layer: In-memory store for real-time vitals
+    batch_buffer,   # Batch Layer: Background persistence to SQLite
+    speed_aggregator,  # Speed Layer: Multi-source aggregation
 )
 from claude_agent import get_agent, HealthCoachAgent
 from wellness import calculate_wellness_score, get_wellness_recommendations
@@ -54,7 +57,12 @@ class AnomalyInjectRequest(BaseModel):
 
 # Global state
 class ConnectionManager:
-    """Manages WebSocket connections and broadcasts."""
+    """Manages WebSocket connections and broadcasts.
+    
+    Lambda Architecture:
+    - Speed Layer: vitals_store (in-memory) for real-time access
+    - Batch Layer: batch_buffer → SQLite for historical queries
+    """
     
     def __init__(self):
         self.active_connections: Set[WebSocket] = set()
@@ -65,13 +73,6 @@ class ConnectionManager:
             "total_alerts": 0,
             "connections_total": 0,
         }
-        
-        # Write buffer for batching database operations
-        self._write_buffer: list = []
-        self._write_lock = asyncio.Lock()
-        self._flush_task: Optional[asyncio.Task] = None
-        self._flush_interval = 2.0  # Flush every 2 seconds
-        self._max_buffer_size = 50  # Or when buffer reaches 50 items
     
     async def connect(self, websocket: WebSocket):
         """Accept and register a new WebSocket connection."""
@@ -100,20 +101,49 @@ class ConnectionManager:
         self.chat_connections.pop(session_id, None)
     
     async def broadcast(self, message: dict):
-        """Broadcast a message to all connected clients (non-blocking)."""
-        # Update buffer (synchronous, fast)
+        """Broadcast a message to all connected clients (non-blocking).
+        
+        Lambda Architecture Data Flow:
+        1. Speed Layer: vitals_store.add() - instant in-memory storage
+        2. Speed Layer: speed_aggregator.add_event() - multi-source fusion
+        3. Batch Layer: batch_buffer.add() - queued for SQLite persistence
+        4. WebSocket: broadcast aggregated state to all connected clients
+        """
+        # Update buffer for new WebSocket connections
         self.message_buffer.add_message(message)
         
-        # Update stats (synchronous, fast)
         if message["type"] == "vital":
             self.stats["total_vitals"] += 1
+            data = message["data"]
+            
+            # SPEED LAYER: Store raw event in-memory for real-time queries
+            vitals_store.add(data)
+            
+            # SPEED LAYER: Update multi-source aggregator
+            speed_aggregator.add_event(data)
+            
+            # BATCH LAYER: Queue for SQLite persistence (non-blocking)
+            batch_buffer.add(data)
+            
+            # Get aggregated state for broadcast
+            aggregated = speed_aggregator.get_aggregated_state()
+            
+            # Build enhanced message with both raw and aggregated data
+            broadcast_message = {
+                "type": "vital",
+                "data": data,  # Raw event (for charts, detailed views)
+                "aggregated": aggregated,  # Aggregated state (for main display)
+            }
+            
         elif message["type"] == "alert":
             self.stats["total_alerts"] += 1
+            # Store alerts to SQLite (infrequent, acceptable)
+            asyncio.create_task(self._store_alert(message["data"]))
             # Enrich alert with AI insight (async, non-blocking)
             asyncio.create_task(self._enrich_alert(message["data"]))
-        
-        # Store to database (non-blocking, runs in background)
-        asyncio.create_task(self._store_message(message))
+            broadcast_message = message
+        else:
+            broadcast_message = message
         
         if not self.active_connections:
             return
@@ -121,7 +151,7 @@ class ConnectionManager:
         # Broadcast to all connections in parallel (don't wait for slow clients)
         async def safe_send(ws: WebSocket) -> WebSocket | None:
             try:
-                await asyncio.wait_for(ws.send_json(message), timeout=1.0)
+                await asyncio.wait_for(ws.send_json(broadcast_message), timeout=1.0)
                 return None
             except Exception:
                 return ws
@@ -137,69 +167,12 @@ class ConnectionManager:
             if isinstance(result, WebSocket):
                 self.active_connections.discard(result)
     
-    def start_flush_loop(self):
-        """Start the background flush loop for batched database writes."""
-        if self._flush_task is None or self._flush_task.done():
-            self._flush_task = asyncio.create_task(self._flush_loop())
-    
-    async def _flush_loop(self):
-        """Background loop that periodically flushes the write buffer."""
-        while True:
-            try:
-                await asyncio.sleep(self._flush_interval)
-                await self._flush_write_buffer()
-            except asyncio.CancelledError:
-                # Final flush on shutdown
-                await self._flush_write_buffer()
-                break
-            except Exception as e:
-                print(f"Error in flush loop: {e}")
-    
-    async def _flush_write_buffer(self):
-        """Flush accumulated messages to database in a batch."""
-        async with self._write_lock:
-            if not self._write_buffer:
-                return
-            
-            # Grab all messages and clear buffer
-            messages = self._write_buffer.copy()
-            self._write_buffer.clear()
-        
-        # Separate vitals and alerts
-        vitals = [m["data"] for m in messages if m["type"] == "vital"]
-        alerts = [m["data"] for m in messages if m["type"] == "alert"]
-        
-        # Batch insert vitals
-        if vitals:
-            try:
-                await VitalsRepository.bulk_insert_vitals(vitals)
-            except Exception as e:
-                print(f"Error batch inserting vitals: {e}")
-        
-        # Insert alerts individually (usually few)
-        for alert in alerts:
-            try:
-                await AlertsRepository.insert(alert)
-            except Exception as e:
-                print(f"Error inserting alert: {e}")
-        
-        # Update baseline with last vital (occasional)
-        if vitals and len(vitals) > 0:
-            try:
-                user_id = vitals[-1].get("user_id", "user_001")
-                await BaselinesRepository.auto_update_baseline(user_id, vitals[-1])
-            except Exception as e:
-                print(f"Error updating baseline: {e}")
-    
-    async def _store_message(self, message: dict):
-        """Queue message for batched database storage."""
-        async with self._write_lock:
-            self._write_buffer.append(message)
-            
-            # Force flush if buffer is full
-            if len(self._write_buffer) >= self._max_buffer_size:
-                # Schedule immediate flush
-                asyncio.create_task(self._flush_write_buffer())
+    async def _store_alert(self, alert_data: dict):
+        """Store alert to SQLite (alerts are infrequent, so this is fine)."""
+        try:
+            await AlertsRepository.insert(alert_data)
+        except Exception as e:
+            print(f"Error storing alert: {e}")
     
     async def _enrich_alert(self, alert_data: dict):
         """Enrich alert with AI-generated insight."""
@@ -241,9 +214,10 @@ async def lifespan(app: FastAPI):
     print(f"  Multi-Source Mode: Enabled")
     print(f"  Sources: Apple, Google, Oura")
     print(f"  Alerts Topic: {KAFKA_ALERTS_TOPIC}")
+    print(f"  Architecture: Lambda (Speed + Batch Layers)")
     print("=" * 60)
     
-    # Initialize database
+    # Initialize database (wipes tables for fresh start)
     await init_database()
     
     # Initialize multi-source Kafka consumer
@@ -259,15 +233,18 @@ async def lifespan(app: FastAPI):
     loop = asyncio.get_event_loop()
     await kafka_consumer.start(loop)
     
-    # Start the database write buffer flush loop
-    manager.start_flush_loop()
+    # Start the Batch Layer flush loop (persists to SQLite every 5 seconds)
+    batch_buffer.start_flush_loop(loop)
     
-    print("✓ Telara API Server ready (multi-source mode)")
+    print("✓ Telara API Server ready (Lambda Architecture)")
+    print(f"  Speed Layer: In-memory vitals store (max 2000 events)")
+    print(f"  Batch Layer: SQLite persistence (5s flush interval)")
     
     yield
     
     # Shutdown
     print("Shutting down Telara API Server...")
+    await batch_buffer.stop()  # Final flush to SQLite
     await kafka_consumer.stop()
 
 
@@ -337,6 +314,68 @@ async def get_stats():
             for source_id, s in source_status.items()
         }
     }
+
+
+# ==============================================================================
+# REST Endpoints - Data Layer Status (Lambda Architecture)
+# ==============================================================================
+
+@app.get("/data/status")
+async def get_data_status():
+    """
+    Get status of both data layers in the Lambda Architecture.
+    
+    Returns:
+    - realtime: Speed Layer (in-memory) statistics
+    - historical: Batch Layer (SQLite) statistics
+    - batch_buffer: Pending events waiting to be flushed
+    """
+    # Speed Layer stats
+    time_range = vitals_store.get_time_range()
+    realtime_stats = {
+        "events_in_memory": vitals_store.count(),
+        "oldest_event": time_range["oldest"],
+        "newest_event": time_range["newest"],
+        "max_capacity": 2000,
+    }
+    
+    # Batch Layer stats
+    historical_stats = await VitalsRepository.get_historical_stats()
+    
+    # Batch buffer stats
+    buffer_stats = batch_buffer.get_stats()
+    
+    return {
+        "realtime": realtime_stats,
+        "historical": historical_stats,
+        "batch_buffer": buffer_stats,
+        "architecture": "lambda",
+        "query_routing": {
+            "realtime_threshold_minutes": VitalsRepository.REALTIME_THRESHOLD_MINUTES,
+            "description": f"Queries <= {VitalsRepository.REALTIME_THRESHOLD_MINUTES} min use Speed Layer, > use Batch Layer"
+        }
+    }
+
+
+@app.delete("/data/historical")
+async def wipe_historical_data():
+    """
+    Wipe all historical data from SQLite (Batch Layer).
+    
+    Useful for resetting before generating new historical data.
+    Does NOT affect the Speed Layer (in-memory store).
+    """
+    # Pause batch buffer during wipe to prevent writes
+    batch_buffer.pause()
+    
+    try:
+        result = await VitalsRepository.wipe_historical_data()
+        return {
+            **result,
+            "message": "Historical data wiped. Generate new data via /generator/historical"
+        }
+    finally:
+        batch_buffer.resume()
 
 
 # ==============================================================================
@@ -611,9 +650,17 @@ async def generate_historical_data(request: HistoricalDataRequest):
     """
     Generate historical biometric data for AI insights (daily digest, weekly comparison).
     
-    This endpoint proxies to the data generator to create backdated events,
-    then bulk inserts them into the database for immediate availability.
+    This endpoint:
+    1. Pauses the Batch Layer (prevents real-time writes during bulk insert)
+    2. Requests synthetic historical data from the data generator
+    3. Bulk inserts events directly into SQLite
+    4. Resumes the Batch Layer
+    
+    Use DELETE /data/historical first to wipe existing data if needed.
     """
+    # Pause batch buffer to prevent real-time writes during bulk insert
+    batch_buffer.pause()
+    
     try:
         # Request historical data from generator with increased timeout
         async with httpx.AsyncClient(timeout=600.0) as client:
@@ -636,7 +683,7 @@ async def generate_historical_data(request: HistoricalDataRequest):
             if data.get("status") != "generated":
                 raise HTTPException(status_code=500, detail=data.get("message", "Generation failed"))
             
-            # Bulk insert events into database
+            # Bulk insert events into database (Batch Layer)
             events = data.get("events", [])
             
             if not events:
@@ -646,7 +693,7 @@ async def generate_historical_data(request: HistoricalDataRequest):
                     "inserted": 0
                 }
             
-            # Bulk insert without updating baselines during insert (avoids locks)
+            # Bulk insert to SQLite
             result = await VitalsRepository.bulk_insert_vitals(events)
             
             return {
@@ -655,13 +702,17 @@ async def generate_historical_data(request: HistoricalDataRequest):
                 "days": request.days,
                 "pattern": request.pattern,
                 "inserted": result.get("inserted", 0),
-                "failed": result.get("failed", 0)
+                "failed": result.get("failed", 0),
+                "note": "Historical data is now available for correlations, daily digest, and weekly comparison"
             }
             
     except httpx.TimeoutException:
         raise HTTPException(status_code=504, detail="Generator timeout - try fewer days or events_per_hour")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # Always resume batch buffer
+        batch_buffer.resume()
 
 
 # ==============================================================================

@@ -1,5 +1,8 @@
 /**
  * WebSocket Hook for Real-time Data Streaming
+ * 
+ * Handles multi-source aggregated data from the Speed Layer.
+ * Each vital message includes both raw event data and aggregated state.
  */
 
 import { useState, useEffect, useRef, useCallback } from 'react';
@@ -16,10 +19,27 @@ const RECONNECT_DELAY = 3000;
 const MAX_RECONNECT_ATTEMPTS = 10;
 const HEARTBEAT_INTERVAL = 25000;
 
+// Aggregated metric value with source attribution
+interface AggregatedMetric {
+  value: number;
+  sources: string[];
+  source_icons: string[];
+  freshness_ms: number;
+  reading_count: number;
+}
+
+// Aggregated state from multi-source fusion
+interface AggregatedState {
+  vitals: Record<string, AggregatedMetric>;
+  last_update: string;
+  source_count: number;
+}
+
 interface UseWebSocketReturn {
   vitals: VitalData[];
   alerts: AlertData[];
   latestVital: VitalData | null;
+  aggregatedState: AggregatedState | null;  // NEW: Aggregated multi-source data
   connectionState: ConnectionState;
   eventsPerSecond: number;
 }
@@ -28,6 +48,7 @@ export function useWebSocket(maxVitals: number = 100): UseWebSocketReturn {
   const [vitals, setVitals] = useState<VitalData[]>([]);
   const [alerts, setAlerts] = useState<AlertData[]>([]);
   const [latestVital, setLatestVital] = useState<VitalData | null>(null);
+  const [aggregatedState, setAggregatedState] = useState<AggregatedState | null>(null);
   const [connectionState, setConnectionState] = useState<ConnectionState>({
     status: 'connecting',
     lastHeartbeat: null,
@@ -38,20 +59,25 @@ export function useWebSocket(maxVitals: number = 100): UseWebSocketReturn {
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<number | null>(null);
   const heartbeatIntervalRef = useRef<number | null>(null);
-  const eventCountRef = useRef(0);
-  const lastSecondRef = useRef(Date.now());
+  
+  // Rolling window for smooth evt/s calculation (5-second window)
+  const eventTimestampsRef = useRef<number[]>([]);
+  const RATE_WINDOW_MS = 5000;
 
-  // Calculate events per second
+  // Calculate events per second using rolling window
+  // This smooths out Kafka batch arrivals for stable display
   useEffect(() => {
     const interval = setInterval(() => {
       const now = Date.now();
-      const elapsed = (now - lastSecondRef.current) / 1000;
-      if (elapsed >= 1) {
-        setEventsPerSecond(Math.round(eventCountRef.current / elapsed));
-        eventCountRef.current = 0;
-        lastSecondRef.current = now;
-      }
-    }, 1000);
+      const cutoff = now - RATE_WINDOW_MS;
+      
+      // Remove timestamps older than the window
+      eventTimestampsRef.current = eventTimestampsRef.current.filter(t => t > cutoff);
+      
+      // Calculate rate: events in window / window size in seconds
+      const eventsInWindow = eventTimestampsRef.current.length;
+      setEventsPerSecond(Math.round(eventsInWindow / (RATE_WINDOW_MS / 1000)));
+    }, 500); // Update every 500ms for responsive UI
 
     return () => clearInterval(interval);
   }, []);
@@ -86,7 +112,7 @@ export function useWebSocket(maxVitals: number = 100): UseWebSocketReturn {
 
       ws.onmessage = (event) => {
         try {
-          const message: WebSocketMessage = JSON.parse(event.data);
+          const message = JSON.parse(event.data);
 
           switch (message.type) {
             case 'vital':
@@ -97,7 +123,14 @@ export function useWebSocket(maxVitals: number = 100): UseWebSocketReturn {
                   const updated = [...prev, vital];
                   return updated.slice(-maxVitals);
                 });
-                eventCountRef.current++;
+                
+                // Update aggregated state if present (multi-source fusion)
+                if (message.aggregated) {
+                  setAggregatedState(message.aggregated as AggregatedState);
+                }
+                
+                // Track event timestamp for rolling rate calculation
+                eventTimestampsRef.current.push(Date.now());
               }
               break;
 
@@ -193,6 +226,7 @@ export function useWebSocket(maxVitals: number = 100): UseWebSocketReturn {
     vitals,
     alerts,
     latestVital,
+    aggregatedState,
     connectionState,
     eventsPerSecond,
   };

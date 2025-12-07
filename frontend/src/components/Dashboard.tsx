@@ -102,19 +102,30 @@ function VitalIndicator({
   label, 
   value, 
   unit,
-  color = 'text-accent-cyan'
+  color = 'text-accent-cyan',
+  sourceIcons = [],
+  isFresh = true,
 }: {
   icon: React.ElementType;
   label: string;
   value: string | number | null;
   unit: string;
   color?: string;
+  sourceIcons?: string[];
+  isFresh?: boolean;
 }) {
   return (
-    <div className="flex items-center gap-3 bg-soc-panel/50 rounded-lg px-4 py-3 border border-soc-border/50">
+    <div className={`flex items-center gap-3 bg-soc-panel/50 rounded-lg px-4 py-3 border border-soc-border/50 ${!isFresh ? 'opacity-60' : ''}`}>
       <Icon size={20} className={color} />
-      <div>
-        <div className="text-xs text-soc-muted uppercase tracking-wider">{label}</div>
+      <div className="flex-1">
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-soc-muted uppercase tracking-wider">{label}</span>
+          {sourceIcons.length > 0 && (
+            <span className="text-xs" title={`Sources: ${sourceIcons.join(', ')}`}>
+              {sourceIcons.slice(0, 3).join('')}
+            </span>
+          )}
+        </div>
         <div className="text-lg font-bold font-mono">
           {value ?? '--'} <span className="text-sm text-soc-muted font-normal">{unit}</span>
         </div>
@@ -126,10 +137,23 @@ function VitalIndicator({
 type ViewMode = 'dashboard' | 'insights' | 'integrations';
 
 export function Dashboard() {
-  const { vitals, alerts, latestVital, connectionState, eventsPerSecond } = useWebSocket(100);
+  const { vitals, alerts, latestVital, aggregatedState, connectionState, eventsPerSecond } = useWebSocket(100);
   const [viewMode, setViewMode] = useState<ViewMode>('dashboard');
   const [showControlModal, setShowControlModal] = useState(false);
   const [dataPreloaded, setDataPreloaded] = useState(false);
+  
+  // Helper to get aggregated metric value and source info
+  const getAggregatedMetric = (metricName: string) => {
+    if (aggregatedState?.vitals?.[metricName]) {
+      const metric = aggregatedState.vitals[metricName];
+      return {
+        value: metric.value,
+        sourceIcons: metric.source_icons || [],
+        isFresh: metric.freshness_ms < 10000, // 10 second freshness
+      };
+    }
+    return { value: null, sourceIcons: [], isFresh: true };
+  };
   
   // Preload all data on mount for faster tab switching
   useEffect(() => {
@@ -236,49 +260,61 @@ export function Dashboard() {
 
       {/* Main Content */}
       <main className="container mx-auto px-6 py-6">
-        {/* Quick Stats Bar */}
+        {/* Quick Stats Bar - Multi-Source Aggregated Display */}
         <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4 mb-6">
           <VitalIndicator 
             icon={Heart} 
             label="Heart Rate" 
-            value={latestVital?.heart_rate}
+            value={getAggregatedMetric('heart_rate').value ?? latestVital?.heart_rate}
             unit="bpm"
             color="text-vital-critical"
+            sourceIcons={getAggregatedMetric('heart_rate').sourceIcons}
+            isFresh={getAggregatedMetric('heart_rate').isFresh}
           />
           <VitalIndicator 
             icon={TrendingUp} 
             label="HRV" 
-            value={latestVital?.hrv_ms}
+            value={getAggregatedMetric('hrv_ms').value ?? latestVital?.hrv_ms}
             unit="ms"
             color="text-accent-purple"
+            sourceIcons={getAggregatedMetric('hrv_ms').sourceIcons}
+            isFresh={getAggregatedMetric('hrv_ms').isFresh}
           />
           <VitalIndicator 
             icon={Droplets} 
             label="SpO2" 
-            value={latestVital?.spo2_percent}
+            value={getAggregatedMetric('spo2_percent').value ?? latestVital?.spo2_percent}
             unit="%"
             color="text-vital-info"
+            sourceIcons={getAggregatedMetric('spo2_percent').sourceIcons}
+            isFresh={getAggregatedMetric('spo2_percent').isFresh}
           />
           <VitalIndicator 
             icon={Thermometer} 
             label="Temperature" 
-            value={latestVital?.skin_temp_c?.toFixed(1)}
+            value={getAggregatedMetric('skin_temp_c').value ?? latestVital?.skin_temp_c?.toFixed(1)}
             unit="°C"
             color="text-vital-warning"
+            sourceIcons={getAggregatedMetric('skin_temp_c').sourceIcons}
+            isFresh={getAggregatedMetric('skin_temp_c').isFresh}
           />
           <VitalIndicator 
             icon={Wind} 
             label="Resp. Rate" 
-            value={latestVital?.respiratory_rate}
+            value={getAggregatedMetric('respiratory_rate').value ?? latestVital?.respiratory_rate}
             unit="/min"
             color="text-accent-cyan"
+            sourceIcons={getAggregatedMetric('respiratory_rate').sourceIcons}
+            isFresh={getAggregatedMetric('respiratory_rate').isFresh}
           />
           <VitalIndicator 
             icon={Activity} 
             label="Activity" 
-            value={latestVital?.activity_level}
+            value={getAggregatedMetric('activity_level').value ?? latestVital?.activity_level}
             unit="lvl"
             color="text-vital-normal"
+            sourceIcons={getAggregatedMetric('activity_level').sourceIcons}
+            isFresh={getAggregatedMetric('activity_level').isFresh}
           />
         </div>
 

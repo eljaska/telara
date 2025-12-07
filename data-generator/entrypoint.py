@@ -57,7 +57,6 @@ def main():
     def signal_handler(signum, frame):
         print("\nReceived shutdown signal...")
         producer.running = False
-        producer.producer.running = False
         sys.exit(0)
     
     signal.signal(signal.SIGINT, signal_handler)
@@ -76,11 +75,10 @@ def main():
         # Set up auto-anomaly if enabled (affects all sources)
         if auto_anomaly:
             print("Auto-anomaly injection enabled. First anomaly in 60 seconds.")
-            setup_anomaly_trigger(producer.producer)
+            setup_anomaly_trigger(producer)
         
         # Run multi-source producer main loop
         producer.running = True
-        producer.producer.running = True
         interval_sec = producer.base_interval_ms / 1000.0
         last_print_time = 0
         
@@ -90,8 +88,9 @@ def main():
         print(f"  Base Interval: {producer.base_interval_ms}ms")
         print(f"  Sources:")
         for source in producer.sources.values():
+            profile = source["profile"]
             status = "✓" if source["enabled"] else "✗"
-            print(f"    {status} {source['name']} -> {source['topic']}")
+            print(f"    {status} {profile.name} -> {profile.topic}")
         print(f"{'='*60}\n")
         
         while producer.running:

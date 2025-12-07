@@ -115,11 +115,13 @@ services:
       - flink-taskmanager
 
   # ============================================
-  # DATA GENERATOR - Multi-Source Biometrics Producer
+  # DATA GENERATOR - Ground Truth Multi-Source Producer
   # Produces to separate Kafka topics per source:
   #   - biometrics-apple (Apple HealthKit)
   #   - biometrics-google (Google Fit)
   #   - biometrics-oura (Oura Ring)
+  # Uses Ground Truth architecture for consistent cross-source data
+  # Each source samples at its own rate (Apple: 1s, Google: 1.5s, Oura: 2s)
   # ============================================
   data-generator:
     build:
@@ -131,11 +133,8 @@ services:
       - "8001:8001"
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      KAFKA_TOPIC: biometrics-raw  # Legacy fallback
-      EVENT_INTERVAL_MS: 500
       AUTO_START: "true"
       AUTO_ANOMALY: "false"
-      MULTI_SOURCE: "true"  # Enable multi-source mode
       CONTROL_PORT: 8001
     networks:
       - telara-network

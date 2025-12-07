@@ -1,13 +1,16 @@
 """
 Telara SQLite Database Layer
 Stores vitals, alerts, and user baselines for AI analysis.
+Uses in-memory storage for real-time vitals to avoid SQLite locking issues.
 """
 
 import aiosqlite
 import asyncio
+from collections import deque
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 from contextlib import asynccontextmanager
+import threading
 import json
 import os
 
@@ -17,15 +20,526 @@ DATABASE_PATH = os.environ.get("DATABASE_PATH", "/app/data/telara.db")
 _db_lock = asyncio.Lock()
 
 
+class InMemoryVitalsStore:
+    """
+    Thread-safe in-memory store for real-time vitals data.
+    Uses a ring buffer (deque) to store the last N vitals, avoiding SQLite locking.
+    """
+    
+    def __init__(self, max_size: int = 2000):
+        self._vitals: deque = deque(maxlen=max_size)
+        self._lock = threading.Lock()
+        self._baseline_data: Dict[str, Dict] = {}  # user_id -> baseline stats
+    
+    def add(self, vital_data: Dict[str, Any]) -> None:
+        """Add a vital reading to the store."""
+        with self._lock:
+            # Add timestamp if not present
+            if "stored_at" not in vital_data:
+                vital_data["stored_at"] = datetime.utcnow().isoformat()
+            self._vitals.append(vital_data)
+            
+            # Update in-memory baseline
+            user_id = vital_data.get("user_id", "user_001")
+            self._update_baseline(user_id, vital_data)
+    
+    def _update_baseline(self, user_id: str, vital_data: Dict) -> None:
+        """Update running baseline statistics for a user."""
+        alpha = 0.1  # EMA smoothing factor
+        
+        if user_id not in self._baseline_data:
+            self._baseline_data[user_id] = {
+                "avg_heart_rate": vital_data.get("heart_rate", 72),
+                "avg_hrv": vital_data.get("hrv_ms", 50),
+                "avg_spo2": vital_data.get("spo2_percent", 98),
+                "avg_temp": vital_data.get("skin_temp_c", 36.5),
+                "avg_activity": vital_data.get("activity_level", 20),
+                "data_points": 1,
+            }
+            return
+        
+        baseline = self._baseline_data[user_id]
+        
+        # EMA update for each metric
+        if vital_data.get("heart_rate"):
+            baseline["avg_heart_rate"] = alpha * vital_data["heart_rate"] + (1 - alpha) * baseline["avg_heart_rate"]
+        if vital_data.get("hrv_ms"):
+            baseline["avg_hrv"] = alpha * vital_data["hrv_ms"] + (1 - alpha) * baseline["avg_hrv"]
+        if vital_data.get("spo2_percent"):
+            baseline["avg_spo2"] = alpha * vital_data["spo2_percent"] + (1 - alpha) * baseline["avg_spo2"]
+        if vital_data.get("skin_temp_c"):
+            baseline["avg_temp"] = alpha * vital_data["skin_temp_c"] + (1 - alpha) * baseline["avg_temp"]
+        if vital_data.get("activity_level"):
+            baseline["avg_activity"] = alpha * vital_data["activity_level"] + (1 - alpha) * baseline["avg_activity"]
+        
+        baseline["data_points"] += 1
+    
+    def get_recent(self, minutes: int = 60, user_id: str = "user_001") -> List[Dict]:
+        """Get vitals from the last N minutes."""
+        with self._lock:
+            cutoff = datetime.utcnow() - timedelta(minutes=minutes)
+            result = []
+            for vital in reversed(self._vitals):
+                # Parse timestamp
+                ts_str = vital.get("timestamp") or vital.get("stored_at")
+                if ts_str:
+                    try:
+                        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00").replace("+00:00", ""))
+                    except:
+                        continue
+                    
+                    if ts < cutoff:
+                        break  # Since we're iterating in reverse, we can stop here
+                    
+                    if vital.get("user_id") == user_id:
+                        result.append(vital)
+            
+            return result
+    
+    def get_latest(self, user_id: str = "user_001") -> Optional[Dict]:
+        """Get the most recent vital reading."""
+        with self._lock:
+            for vital in reversed(self._vitals):
+                if vital.get("user_id") == user_id:
+                    return vital
+            return None
+    
+    def get_all(self) -> List[Dict]:
+        """Get all vitals in the store."""
+        with self._lock:
+            return list(self._vitals)
+    
+    def get_stats(self, minutes: int = 60, user_id: str = "user_001") -> Dict:
+        """Get statistical summary of recent vitals."""
+        vitals = self.get_recent(minutes=minutes, user_id=user_id)
+        
+        if not vitals:
+            return {"count": 0}
+        
+        hr_values = [v.get("heart_rate") for v in vitals if v.get("heart_rate")]
+        hrv_values = [v.get("hrv_ms") for v in vitals if v.get("hrv_ms")]
+        spo2_values = [v.get("spo2_percent") for v in vitals if v.get("spo2_percent")]
+        temp_values = [v.get("skin_temp_c") for v in vitals if v.get("skin_temp_c")]
+        activity_values = [v.get("activity_level") for v in vitals if v.get("activity_level")]
+        
+        return {
+            "count": len(vitals),
+            "avg_hr": sum(hr_values) / len(hr_values) if hr_values else None,
+            "min_hr": min(hr_values) if hr_values else None,
+            "max_hr": max(hr_values) if hr_values else None,
+            "avg_hrv": sum(hrv_values) / len(hrv_values) if hrv_values else None,
+            "avg_spo2": sum(spo2_values) / len(spo2_values) if spo2_values else None,
+            "avg_temp": sum(temp_values) / len(temp_values) if temp_values else None,
+            "avg_activity": sum(activity_values) / len(activity_values) if activity_values else None,
+        }
+    
+    def get_baseline(self, user_id: str = "user_001") -> Optional[Dict]:
+        """Get baseline data for a user."""
+        with self._lock:
+            return self._baseline_data.get(user_id)
+    
+    def clear(self) -> None:
+        """Clear all data from the store."""
+        with self._lock:
+            self._vitals.clear()
+            self._baseline_data.clear()
+    
+    def count(self) -> int:
+        """Get the number of vitals in the store."""
+        with self._lock:
+            return len(self._vitals)
+    
+    def get_time_range(self) -> Dict[str, Optional[str]]:
+        """Get the oldest and newest event timestamps."""
+        with self._lock:
+            if not self._vitals:
+                return {"oldest": None, "newest": None}
+            
+            oldest = self._vitals[0].get("timestamp") or self._vitals[0].get("stored_at")
+            newest = self._vitals[-1].get("timestamp") or self._vitals[-1].get("stored_at")
+            return {"oldest": oldest, "newest": newest}
+
+
+class SpeedLayerAggregator:
+    """
+    Aggregates multi-source health data for real-time display.
+    
+    The clever part of our Lambda architecture:
+    - Tracks latest value from each source for each metric
+    - Computes "best" display value (most recent within freshness window)
+    - Shows source attribution (which devices contributed)
+    
+    Example:
+        Apple reports HR=73, Google reports HR=75 at similar times.
+        Aggregator shows: HR=75 (most recent), sources: [apple, google]
+    """
+    
+    # Metrics that can come from multiple sources
+    AGGREGATABLE_METRICS = [
+        "heart_rate", "hrv_ms", "spo2_percent", "skin_temp_c",
+        "respiratory_rate", "activity_level", "steps_per_minute",
+        "calories_per_minute", "sleep_quality"
+    ]
+    
+    # Source icons for display
+    SOURCE_ICONS = {
+        "apple": "🍎",
+        "google": "📱",
+        "oura": "💍",
+    }
+    
+    # Freshness window - values older than this are considered stale
+    FRESHNESS_WINDOW_MS = 10000  # 10 seconds
+    
+    def __init__(self):
+        self._lock = threading.Lock()
+        
+        # Latest reading per source per metric
+        # Structure: {metric: {source: {"value": x, "timestamp": t}}}
+        self._latest_by_source: Dict[str, Dict[str, Dict[str, Any]]] = {
+            metric: {} for metric in self.AGGREGATABLE_METRICS
+        }
+        
+        # Cached aggregated state
+        self._aggregated_state: Dict[str, Dict[str, Any]] = {}
+        self._last_update = datetime.utcnow()
+    
+    def add_event(self, event: Dict[str, Any]) -> None:
+        """
+        Process an incoming event and update the aggregated state.
+        
+        Args:
+            event: Raw event with source field and metric values
+        """
+        source = event.get("source")
+        if not source:
+            return
+        
+        timestamp = event.get("timestamp") or datetime.utcnow().isoformat()
+        
+        with self._lock:
+            # Update latest value for each metric from this source
+            for metric in self.AGGREGATABLE_METRICS:
+                if metric in event and event[metric] is not None:
+                    if metric not in self._latest_by_source:
+                        self._latest_by_source[metric] = {}
+                    
+                    self._latest_by_source[metric][source] = {
+                        "value": event[metric],
+                        "timestamp": timestamp,
+                        "source_name": event.get("source_name", source),
+                    }
+            
+            # Recompute aggregated state
+            self._recompute_aggregated_state()
+    
+    def _recompute_aggregated_state(self) -> None:
+        """Recompute the aggregated display state from latest readings."""
+        now = datetime.utcnow()
+        cutoff = now - timedelta(milliseconds=self.FRESHNESS_WINDOW_MS)
+        
+        new_state = {}
+        
+        for metric, sources in self._latest_by_source.items():
+            # Get fresh readings only
+            fresh_readings = []
+            for source, data in sources.items():
+                try:
+                    ts_str = data["timestamp"]
+                    # Parse ISO timestamp
+                    if "+" in ts_str or ts_str.endswith("Z"):
+                        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00").replace("+00:00", ""))
+                    else:
+                        ts = datetime.fromisoformat(ts_str)
+                    
+                    # Check freshness
+                    if ts > cutoff or (now - ts).total_seconds() < self.FRESHNESS_WINDOW_MS / 1000:
+                        fresh_readings.append({
+                            "source": source,
+                            "value": data["value"],
+                            "timestamp": ts,
+                            "age_ms": int((now - ts).total_seconds() * 1000),
+                        })
+                except Exception:
+                    # Include if we can't parse timestamp (assume fresh)
+                    fresh_readings.append({
+                        "source": source,
+                        "value": data["value"],
+                        "timestamp": now,
+                        "age_ms": 0,
+                    })
+            
+            if not fresh_readings:
+                continue
+            
+            # Sort by timestamp (most recent first)
+            fresh_readings.sort(key=lambda x: x["timestamp"], reverse=True)
+            
+            # Best value = most recent
+            best = fresh_readings[0]
+            
+            new_state[metric] = {
+                "value": best["value"],
+                "sources": [r["source"] for r in fresh_readings],
+                "source_icons": [self.SOURCE_ICONS.get(r["source"], "📊") for r in fresh_readings],
+                "freshness_ms": best["age_ms"],
+                "reading_count": len(fresh_readings),
+            }
+        
+        self._aggregated_state = new_state
+        self._last_update = now
+    
+    def get_aggregated_state(self) -> Dict[str, Any]:
+        """
+        Get the current aggregated state for display.
+        
+        Returns:
+            Dict with best values, source attribution, and freshness info.
+        """
+        with self._lock:
+            # Recompute to ensure freshness is current
+            self._recompute_aggregated_state()
+            
+            return {
+                "vitals": self._aggregated_state.copy(),
+                "last_update": self._last_update.isoformat(),
+                "source_count": self._count_active_sources(),
+            }
+    
+    def _count_active_sources(self) -> int:
+        """Count sources that have contributed fresh data."""
+        active = set()
+        now = datetime.utcnow()
+        cutoff_sec = self.FRESHNESS_WINDOW_MS / 1000
+        
+        for metric, sources in self._latest_by_source.items():
+            for source, data in sources.items():
+                try:
+                    ts_str = data["timestamp"]
+                    if "+" in ts_str or ts_str.endswith("Z"):
+                        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00").replace("+00:00", ""))
+                    else:
+                        ts = datetime.fromisoformat(ts_str)
+                    
+                    if (now - ts).total_seconds() < cutoff_sec:
+                        active.add(source)
+                except:
+                    active.add(source)
+        
+        return len(active)
+    
+    def get_source_breakdown(self, metric: str) -> List[Dict[str, Any]]:
+        """Get detailed breakdown of all source readings for a metric."""
+        with self._lock:
+            if metric not in self._latest_by_source:
+                return []
+            
+            readings = []
+            for source, data in self._latest_by_source[metric].items():
+                readings.append({
+                    "source": source,
+                    "source_name": data.get("source_name", source),
+                    "icon": self.SOURCE_ICONS.get(source, "📊"),
+                    "value": data["value"],
+                    "timestamp": data["timestamp"],
+                })
+            
+            return sorted(readings, key=lambda x: x["timestamp"], reverse=True)
+    
+    def clear(self) -> None:
+        """Clear all aggregated data."""
+        with self._lock:
+            self._latest_by_source = {metric: {} for metric in self.AGGREGATABLE_METRICS}
+            self._aggregated_state = {}
+
+
+class BatchWriteBuffer:
+    """
+    Batch layer for Lambda Architecture.
+    Accumulates real-time events and periodically flushes to SQLite.
+    Runs in background, never blocks the speed layer.
+    """
+    
+    def __init__(self, flush_interval: float = 5.0, batch_size: int = 100):
+        self._buffer: List[Dict[str, Any]] = []
+        self._lock = threading.Lock()
+        self._flush_interval = flush_interval
+        self._batch_size = batch_size
+        self._enabled = True
+        self._paused = False
+        self._flush_task: Optional[asyncio.Task] = None
+        self._total_flushed = 0
+        self._last_flush_time: Optional[datetime] = None
+    
+    def add(self, event: Dict[str, Any]) -> None:
+        """Queue event for batch write (non-blocking)."""
+        if not self._enabled or self._paused:
+            return
+        
+        with self._lock:
+            self._buffer.append(event.copy())
+    
+    def pause(self) -> None:
+        """Pause batch writes (used during historical data generation)."""
+        self._paused = True
+        print("BatchWriteBuffer: Paused")
+    
+    def resume(self) -> None:
+        """Resume batch writes."""
+        self._paused = False
+        print("BatchWriteBuffer: Resumed")
+    
+    def is_paused(self) -> bool:
+        """Check if buffer is paused."""
+        return self._paused
+    
+    def clear(self) -> None:
+        """Clear the pending buffer."""
+        with self._lock:
+            self._buffer.clear()
+    
+    def pending_count(self) -> int:
+        """Get number of events waiting to be flushed."""
+        with self._lock:
+            return len(self._buffer)
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get buffer statistics."""
+        with self._lock:
+            return {
+                "pending": len(self._buffer),
+                "total_flushed": self._total_flushed,
+                "last_flush": self._last_flush_time.isoformat() if self._last_flush_time else None,
+                "enabled": self._enabled,
+                "paused": self._paused,
+            }
+    
+    def start_flush_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Start the background flush loop."""
+        if self._flush_task is None or self._flush_task.done():
+            self._flush_task = loop.create_task(self._flush_loop())
+            print(f"BatchWriteBuffer: Started (interval={self._flush_interval}s, batch_size={self._batch_size})")
+    
+    async def stop(self) -> None:
+        """Stop the flush loop and do a final flush."""
+        self._enabled = False
+        if self._flush_task:
+            self._flush_task.cancel()
+            try:
+                await self._flush_task
+            except asyncio.CancelledError:
+                pass
+        # Final flush
+        await self.flush()
+        print("BatchWriteBuffer: Stopped")
+    
+    async def _flush_loop(self) -> None:
+        """Background loop that periodically flushes the buffer."""
+        while self._enabled:
+            try:
+                await asyncio.sleep(self._flush_interval)
+                if not self._paused:
+                    await self.flush()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"BatchWriteBuffer: Error in flush loop: {e}")
+    
+    async def flush(self) -> int:
+        """Flush accumulated events to SQLite. Returns number of events flushed."""
+        # Grab events to flush
+        with self._lock:
+            if not self._buffer:
+                return 0
+            events_to_flush = self._buffer[:self._batch_size]
+            self._buffer = self._buffer[self._batch_size:]
+        
+        if not events_to_flush:
+            return 0
+        
+        # Write to SQLite
+        try:
+            async with aiosqlite.connect(DATABASE_PATH, timeout=30.0) as db:
+                await db.execute("PRAGMA busy_timeout=30000")
+                
+                data_tuples = []
+                for event in events_to_flush:
+                    data_tuples.append((
+                        event.get("event_id"),
+                        event.get("timestamp"),
+                        event.get("user_id"),
+                        event.get("heart_rate"),
+                        event.get("hrv_ms"),
+                        event.get("spo2_percent"),
+                        event.get("skin_temp_c"),
+                        event.get("respiratory_rate"),
+                        event.get("activity_level"),
+                        event.get("steps_per_minute"),
+                        event.get("calories_per_minute"),
+                        event.get("posture"),
+                        event.get("hours_last_night"),
+                        event.get("room_temp_c"),
+                        event.get("humidity_percent"),
+                    ))
+                
+                await db.executemany("""
+                    INSERT OR REPLACE INTO vitals (
+                        event_id, timestamp, user_id, heart_rate, hrv_ms,
+                        spo2_percent, skin_temp_c, respiratory_rate,
+                        activity_level, steps_per_minute, calories_per_minute,
+                        posture, sleep_hours, room_temp_c, humidity_percent
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, data_tuples)
+                
+                await db.commit()
+            
+            with self._lock:
+                self._total_flushed += len(events_to_flush)
+                self._last_flush_time = datetime.utcnow()
+            
+            return len(events_to_flush)
+            
+        except Exception as e:
+            print(f"BatchWriteBuffer: Error flushing to SQLite: {e}")
+            # Put events back in buffer for retry
+            with self._lock:
+                self._buffer = events_to_flush + self._buffer
+            return 0
+
+
+# Global in-memory vitals store (Speed Layer)
+vitals_store = InMemoryVitalsStore(max_size=2000)
+
+# Global batch write buffer (Batch Layer)
+batch_buffer = BatchWriteBuffer(flush_interval=5.0, batch_size=100)
+
+# Global speed layer aggregator (Multi-source fusion)
+speed_aggregator = SpeedLayerAggregator()
+
+
 async def init_database():
-    """Initialize the database with required tables."""
+    """Initialize the database with required tables.
+    
+    Drops existing tables on startup for a fresh state (acceptable for demo).
+    This prevents stale data issues and SQLite corruption from previous runs.
+    """
     os.makedirs(os.path.dirname(DATABASE_PATH), exist_ok=True)
+    
+    # Clear in-memory store for fresh start
+    vitals_store.clear()
+    print("✓ In-memory vitals store cleared")
     
     async with aiosqlite.connect(DATABASE_PATH, timeout=30.0) as db:
         # Enable WAL mode for better concurrent access
         await db.execute("PRAGMA journal_mode=WAL")
         await db.execute("PRAGMA synchronous=NORMAL")
         await db.execute("PRAGMA busy_timeout=30000")
+        
+        # Drop existing tables for fresh state on each launch (hackathon demo mode)
+        print("  Dropping existing tables for fresh state...")
+        await db.execute("DROP TABLE IF EXISTS vitals")
+        await db.execute("DROP TABLE IF EXISTS alerts")
+        await db.execute("DROP TABLE IF EXISTS user_baselines")
         
         # Vitals table - stores recent biometric data
         await db.execute("""
@@ -113,7 +627,7 @@ async def init_database():
         await db.execute("CREATE INDEX IF NOT EXISTS idx_alerts_severity ON alerts(severity)")
         
         await db.commit()
-        print("✓ Database initialized successfully (WAL mode enabled)")
+        print("✓ Database initialized (fresh tables, WAL mode, in-memory vitals store ready)")
 
 
 @asynccontextmanager
@@ -129,55 +643,61 @@ async def get_db():
 
 
 class VitalsRepository:
-    """Repository for vital signs data operations."""
+    """Repository for vital signs data operations.
+    
+    Lambda Architecture Query Routing:
+    - Speed Layer (memory): Real-time queries (<=30 min)
+    - Batch Layer (SQLite): Historical queries (>30 min)
+    """
+    
+    # Threshold for routing queries to memory vs SQLite
+    REALTIME_THRESHOLD_MINUTES = 30
     
     @staticmethod
     async def insert(vital_data: Dict[str, Any]) -> bool:
-        """Insert a new vital reading."""
+        """Insert a new vital reading into the in-memory store.
+        
+        Note: This only writes to Speed Layer. Batch Layer writes happen
+        via BatchWriteBuffer in the background.
+        """
         try:
-            async with get_db() as db:
-                await db.execute("""
-                    INSERT OR REPLACE INTO vitals (
-                        event_id, timestamp, user_id, heart_rate, hrv_ms,
-                        spo2_percent, skin_temp_c, respiratory_rate,
-                        activity_level, steps_per_minute, calories_per_minute,
-                        posture, sleep_hours, room_temp_c, humidity_percent
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    vital_data.get("event_id"),
-                    vital_data.get("timestamp"),
-                    vital_data.get("user_id"),
-                    vital_data.get("heart_rate"),
-                    vital_data.get("hrv_ms"),
-                    vital_data.get("spo2_percent"),
-                    vital_data.get("skin_temp_c"),
-                    vital_data.get("respiratory_rate"),
-                    vital_data.get("activity_level"),
-                    vital_data.get("steps_per_minute"),
-                    vital_data.get("calories_per_minute"),
-                    vital_data.get("posture"),
-                    vital_data.get("hours_last_night"),
-                    vital_data.get("room_temp_c"),
-                    vital_data.get("humidity_percent"),
-                ))
-                await db.commit()
-                return True
+            vitals_store.add(vital_data)
+            return True
         except Exception as e:
-            print(f"Error inserting vital: {e}")
+            print(f"Error inserting vital to memory: {e}")
             return False
     
     @staticmethod
     async def get_recent(minutes: int = 60, user_id: str = "user_001") -> List[Dict]:
-        """Get vitals from the last N minutes."""
-        async with get_db() as db:
-            cutoff = datetime.utcnow() - timedelta(minutes=minutes)
-            cursor = await db.execute("""
-                SELECT * FROM vitals 
-                WHERE user_id = ? AND timestamp > ?
-                ORDER BY timestamp DESC
-            """, (user_id, cutoff.isoformat()))
-            rows = await cursor.fetchall()
-            return [dict(row) for row in rows]
+        """Get vitals from the last N minutes.
+        
+        Query Routing:
+        - minutes <= 30: Speed Layer (memory) only
+        - minutes > 30: Batch Layer (SQLite) only (historical data)
+        """
+        if minutes <= VitalsRepository.REALTIME_THRESHOLD_MINUTES:
+            # SPEED LAYER: Real-time data from memory
+            return vitals_store.get_recent(minutes=minutes, user_id=user_id)
+        else:
+            # BATCH LAYER: Historical data from SQLite
+            return await VitalsRepository._get_recent_from_sqlite(minutes, user_id)
+    
+    @staticmethod
+    async def _get_recent_from_sqlite(minutes: int, user_id: str) -> List[Dict]:
+        """Get historical vitals from SQLite (Batch Layer)."""
+        try:
+            async with get_db() as db:
+                cutoff = datetime.utcnow() - timedelta(minutes=minutes)
+                cursor = await db.execute("""
+                    SELECT * FROM vitals 
+                    WHERE user_id = ? AND timestamp > ?
+                    ORDER BY timestamp DESC
+                """, (user_id, cutoff.isoformat()))
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            print(f"SQLite get_recent failed: {e}")
+            return []
     
     @staticmethod
     async def get_metric_trend(metric: str, hours: int = 24, user_id: str = "user_001") -> List[Dict]:
@@ -199,37 +719,47 @@ class VitalsRepository:
     
     @staticmethod
     async def get_latest(user_id: str = "user_001") -> Optional[Dict]:
-        """Get the most recent vital reading."""
-        async with get_db() as db:
-            cursor = await db.execute("""
-                SELECT * FROM vitals 
-                WHERE user_id = ?
-                ORDER BY timestamp DESC
-                LIMIT 1
-            """, (user_id,))
-            row = await cursor.fetchone()
-            return dict(row) if row else None
+        """Get the most recent vital reading.
+        
+        Always uses Speed Layer (memory) - this is always real-time.
+        """
+        return vitals_store.get_latest(user_id=user_id)
     
     @staticmethod
     async def get_stats(hours: int = 24, user_id: str = "user_001") -> Dict:
-        """Get statistical summary of vitals."""
-        async with get_db() as db:
-            cutoff = datetime.utcnow() - timedelta(hours=hours)
-            cursor = await db.execute("""
-                SELECT 
-                    COUNT(*) as count,
-                    AVG(heart_rate) as avg_hr,
-                    MIN(heart_rate) as min_hr,
-                    MAX(heart_rate) as max_hr,
-                    AVG(hrv_ms) as avg_hrv,
-                    AVG(spo2_percent) as avg_spo2,
-                    AVG(skin_temp_c) as avg_temp,
-                    AVG(activity_level) as avg_activity
-                FROM vitals 
-                WHERE user_id = ? AND timestamp > ?
-            """, (user_id, cutoff.isoformat()))
-            row = await cursor.fetchone()
-            return dict(row) if row else {}
+        """Get statistical summary of vitals.
+        
+        Query Routing:
+        - hours <= 1: Speed Layer (memory)
+        - hours > 1: Batch Layer (SQLite)
+        """
+        if hours <= 1:
+            # SPEED LAYER: Real-time stats from memory
+            minutes = hours * 60
+            return vitals_store.get_stats(minutes=minutes, user_id=user_id)
+        
+        # BATCH LAYER: Historical stats from SQLite
+        try:
+            async with get_db() as db:
+                cutoff = datetime.utcnow() - timedelta(hours=hours)
+                cursor = await db.execute("""
+                    SELECT 
+                        COUNT(*) as count,
+                        AVG(heart_rate) as avg_hr,
+                        MIN(heart_rate) as min_hr,
+                        MAX(heart_rate) as max_hr,
+                        AVG(hrv_ms) as avg_hrv,
+                        AVG(spo2_percent) as avg_spo2,
+                        AVG(skin_temp_c) as avg_temp,
+                        AVG(activity_level) as avg_activity
+                    FROM vitals 
+                    WHERE user_id = ? AND timestamp > ?
+                """, (user_id, cutoff.isoformat()))
+                row = await cursor.fetchone()
+                return dict(row) if row else stats
+        except Exception as e:
+            print(f"SQLite get_stats failed: {e}")
+            return stats
     
     @staticmethod
     async def cleanup_old_data(hours: int = 48):
@@ -238,6 +768,62 @@ class VitalsRepository:
             cutoff = datetime.utcnow() - timedelta(hours=hours)
             await db.execute("DELETE FROM vitals WHERE timestamp < ?", (cutoff.isoformat(),))
             await db.commit()
+    
+    @staticmethod
+    async def get_historical_stats() -> Dict[str, Any]:
+        """Get statistics about historical data in SQLite (Batch Layer)."""
+        try:
+            async with get_db() as db:
+                # Count total events
+                cursor = await db.execute("SELECT COUNT(*) as count FROM vitals")
+                row = await cursor.fetchone()
+                count = row[0] if row else 0
+                
+                # Get time range
+                cursor = await db.execute("""
+                    SELECT MIN(timestamp) as oldest, MAX(timestamp) as newest 
+                    FROM vitals
+                """)
+                row = await cursor.fetchone()
+                oldest = row[0] if row else None
+                newest = row[1] if row else None
+                
+                return {
+                    "events_in_database": count,
+                    "oldest_event": oldest,
+                    "newest_event": newest,
+                }
+        except Exception as e:
+            print(f"Error getting historical stats: {e}")
+            return {
+                "events_in_database": 0,
+                "oldest_event": None,
+                "newest_event": None,
+                "error": str(e)
+            }
+    
+    @staticmethod
+    async def wipe_historical_data() -> Dict[str, Any]:
+        """Wipe all historical vitals from SQLite (Batch Layer)."""
+        try:
+            async with get_db() as db:
+                cursor = await db.execute("SELECT COUNT(*) FROM vitals")
+                row = await cursor.fetchone()
+                count_before = row[0] if row else 0
+                
+                await db.execute("DELETE FROM vitals")
+                await db.commit()
+                
+                return {
+                    "success": True,
+                    "events_deleted": count_before,
+                }
+        except Exception as e:
+            print(f"Error wiping historical data: {e}")
+            return {
+                "success": False,
+                "error": str(e)
+            }
     
     @staticmethod
     async def bulk_insert_vitals(vitals_list: List[Dict[str, Any]], batch_size: int = 1000) -> Dict[str, Any]:

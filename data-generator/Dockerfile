@@ -15,6 +15,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY schemas.py .
 COPY producer.py .
+COPY ground_truth.py .
 COPY control_server.py .
 COPY entrypoint.py .
 

@@ -33,9 +33,14 @@ interface CorrelationData {
     strong_count: number;
     moderate_count: number;
     top_insights: string[];
+    status?: string;
+    message?: string;
+    progress_percent?: number;
   };
   analysis_period_hours: number;
   calculated_at: string;
+  data_points_available?: number;
+  data_points_required?: number;
 }
 
 interface CorrelationInsightsProps {
@@ -246,7 +251,43 @@ export function CorrelationInsights({ apiUrl }: CorrelationInsightsProps) {
           </div>
 
           {/* Correlation cards */}
-          {significantCorrelations.length > 0 ? (
+          {data.summary.status === 'collecting_data' ? (
+            <div className="text-center py-6">
+              <div className="relative w-16 h-16 mx-auto mb-3">
+                <svg className="w-16 h-16 transform -rotate-90">
+                  <circle
+                    cx="32"
+                    cy="32"
+                    r="28"
+                    stroke="currentColor"
+                    strokeWidth="4"
+                    fill="none"
+                    className="text-soc-border"
+                  />
+                  <circle
+                    cx="32"
+                    cy="32"
+                    r="28"
+                    stroke="currentColor"
+                    strokeWidth="4"
+                    fill="none"
+                    strokeDasharray={`${(data.summary.progress_percent || 0) * 1.76} 176`}
+                    className="text-accent-purple transition-all duration-500"
+                  />
+                </svg>
+                <span className="absolute inset-0 flex items-center justify-center text-xs font-mono text-soc-muted">
+                  {data.summary.progress_percent || 0}%
+                </span>
+              </div>
+              <p className="text-sm text-accent-purple font-medium">Collecting Data</p>
+              <p className="text-xs text-soc-muted mt-1">
+                {data.data_points_available || 0} of {data.data_points_required || 10} readings
+              </p>
+              <p className="text-xs text-soc-muted mt-2">
+                Correlations will appear as more health data is collected.
+              </p>
+            </div>
+          ) : significantCorrelations.length > 0 ? (
             <div className="space-y-3">
               {displayCorrelations.map((corr, i) => (
                 <CorrelationCard key={`${corr.metric1}-${corr.metric2}-${i}`} corr={corr} />
@@ -268,7 +309,11 @@ export function CorrelationInsights({ apiUrl }: CorrelationInsightsProps) {
             <div className="text-center py-6 text-soc-muted text-sm">
               <Minus size={24} className="mx-auto mb-2 opacity-50" />
               <p>No significant correlations detected yet.</p>
-              <p className="text-xs mt-1">More data needed for analysis.</p>
+              <p className="text-xs mt-1">
+                {data.data_points_available && data.data_points_available > 0
+                  ? `Analyzed ${data.data_points_available} readings - more patterns may emerge over time.`
+                  : 'Data is being collected for analysis.'}
+              </p>
             </div>
           )}
         </>

@@ -1,13 +1,17 @@
 """
 Telara Biometric Event Schemas
 Standardized data models for IoT device simulation.
+
+Source Profiles define what fields each health device supports
+and their accuracy characteristics for realistic multi-source simulation.
 """
 
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Dict, Any, Set
 from enum import Enum
 import uuid
+import random
 
 
 class Posture(str, Enum):
@@ -33,6 +37,142 @@ class DeviceSource(str, Enum):
     GARMIN = "garmin"
     DEXCOM_CGM = "dexcom_cgm"
     OMRON_BP = "omron_bp"
+
+
+# =============================================================================
+# SOURCE PROFILES - Define what each health data source supports
+# =============================================================================
+
+@dataclass
+class SourceProfile:
+    """
+    Defines a health data source's capabilities and accuracy.
+    
+    Each source:
+    - Supports specific fields (e.g., Apple has HR, Oura doesn't)
+    - Has different accuracy/noise levels per field
+    - Samples at different intervals
+    """
+    id: str
+    name: str
+    icon: str
+    color: str
+    topic: str  # Kafka topic
+    device_source: str
+    sample_interval_ms: int
+    supported_fields: Set[str]
+    noise_levels: Dict[str, float]  # Standard deviation of noise per field
+    
+    def sample_field(self, field: str, ground_truth_value: float) -> Optional[float]:
+        """
+        Sample a field from ground truth with device-specific noise.
+        Returns None if this source doesn't support the field.
+        """
+        if field not in self.supported_fields:
+            return None
+        
+        noise_std = self.noise_levels.get(field, 0)
+        return ground_truth_value + random.gauss(0, noise_std)
+    
+    def supports(self, field: str) -> bool:
+        """Check if this source supports a given field."""
+        return field in self.supported_fields
+
+
+# Define the three main source profiles
+APPLE_PROFILE = SourceProfile(
+    id="apple",
+    name="Apple HealthKit",
+    icon="🍎",
+    color="#FF3B30",
+    topic="biometrics-apple",
+    device_source=DeviceSource.APPLE_WATCH.value,
+    sample_interval_ms=1000,  # 1 sample per second
+    supported_fields={
+        "heart_rate",
+        "hrv_ms",
+        "respiratory_rate",
+        "activity_level",
+        "steps_per_minute",
+        "calories_per_minute",
+        "spo2_percent",  # Apple Watch Series 6+
+    },
+    noise_levels={
+        "heart_rate": 1.0,       # ±1 bpm (high accuracy)
+        "hrv_ms": 2.0,           # ±2 ms
+        "respiratory_rate": 0.5, # ±0.5 breaths/min
+        "activity_level": 2.0,
+        "steps_per_minute": 1.0,
+        "calories_per_minute": 0.2,
+        "spo2_percent": 0.5,
+    }
+)
+
+GOOGLE_PROFILE = SourceProfile(
+    id="google",
+    name="Google Fit",
+    icon="📱",
+    color="#4285F4",
+    topic="biometrics-google",
+    device_source=DeviceSource.FITBIT.value,  # Often syncs from Fitbit
+    sample_interval_ms=1500,  # Slightly slower
+    supported_fields={
+        "heart_rate",
+        "activity_level",
+        "steps_per_minute",
+        "calories_per_minute",
+    },
+    noise_levels={
+        "heart_rate": 3.0,       # ±3 bpm (lower accuracy than Apple)
+        "activity_level": 3.0,
+        "steps_per_minute": 2.0,
+        "calories_per_minute": 0.3,
+    }
+)
+
+OURA_PROFILE = SourceProfile(
+    id="oura",
+    name="Oura Ring",
+    icon="💍",
+    color="#8B5CF6",
+    topic="biometrics-oura",
+    device_source=DeviceSource.OURA_RING.value,
+    sample_interval_ms=2000,  # Less frequent sampling
+    supported_fields={
+        "hrv_ms",
+        "skin_temp_c",
+        "respiratory_rate",
+        "sleep_quality",  # Readiness score
+        "activity_level",
+    },
+    noise_levels={
+        "hrv_ms": 2.0,           # ±2 ms (excellent HRV accuracy)
+        "skin_temp_c": 0.05,     # ±0.05°C (excellent temp accuracy)
+        "respiratory_rate": 0.3,
+        "sleep_quality": 3.0,
+        "activity_level": 2.0,
+    }
+)
+
+# All source profiles indexed by ID
+SOURCE_PROFILES: Dict[str, SourceProfile] = {
+    "apple": APPLE_PROFILE,
+    "google": GOOGLE_PROFILE,
+    "oura": OURA_PROFILE,
+}
+
+# Field to sources mapping (which sources support each field)
+FIELD_SOURCES: Dict[str, List[str]] = {
+    "heart_rate": ["apple", "google"],
+    "hrv_ms": ["apple", "oura"],
+    "spo2_percent": ["apple"],
+    "skin_temp_c": ["oura"],
+    "respiratory_rate": ["apple", "oura"],
+    "activity_level": ["apple", "google", "oura"],
+    "steps_per_minute": ["apple", "google"],
+    "calories_per_minute": ["apple", "google"],
+    "sleep_quality": ["oura"],
+}
 
 
 @dataclass

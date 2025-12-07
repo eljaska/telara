@@ -366,10 +366,58 @@ async def get_correlation_insights(
 ) -> Dict[str, Any]:
     """
     Get correlation insights for the API endpoint.
+    Returns meaningful response even when insufficient data is available.
     """
-    return await CorrelationEngine.discover_all_correlations(
-        hours=hours,
-        user_id=user_id,
-        include_lagged=True
-    )
+    try:
+        # Check if we have enough data first
+        vitals = await VitalsRepository.get_recent(minutes=hours * 60, user_id=user_id)
+        data_count = len(vitals)
+        
+        if data_count < 10:
+            # Return a helpful response when collecting data
+            return {
+                "correlations": [],
+                "summary": {
+                    "total_analyzed": 0,
+                    "strong_count": 0,
+                    "moderate_count": 0,
+                    "top_insights": [],
+                    "status": "collecting_data",
+                    "message": f"Collecting health data... ({data_count}/10 readings so far)",
+                    "progress_percent": min(100, int((data_count / 10) * 100))
+                },
+                "analysis_period_hours": hours,
+                "calculated_at": datetime.utcnow().isoformat(),
+                "data_points_available": data_count,
+                "data_points_required": 10
+            }
+        
+        result = await CorrelationEngine.discover_all_correlations(
+            hours=hours,
+            user_id=user_id,
+            include_lagged=False  # Disable lagged for fresh demos (need more history)
+        )
+        
+        # Add status to summary
+        result["summary"]["status"] = "ready"
+        result["data_points_available"] = data_count
+        
+        return result
+        
+    except Exception as e:
+        print(f"Error getting correlation insights: {e}")
+        return {
+            "correlations": [],
+            "summary": {
+                "total_analyzed": 0,
+                "strong_count": 0,
+                "moderate_count": 0,
+                "top_insights": [],
+                "status": "error",
+                "message": "Unable to calculate correlations at this time"
+            },
+            "analysis_period_hours": hours,
+            "calculated_at": datetime.utcnow().isoformat(),
+            "error": str(e)
+        }
 

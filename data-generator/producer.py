@@ -2,6 +2,11 @@
 Telara Biometric Data Generator
 Simulates IoT device streams with anomaly injection capability.
 Multi-source architecture: Each health device publishes to its own Kafka topic.
+
+Ground Truth Architecture:
+- A single PhysiologicalState maintains the user's actual health metrics
+- Each source (Apple, Google, Oura) samples this state with device-specific noise
+- This ensures consistent values across sources at similar times
 """
 
 import os
@@ -20,8 +25,10 @@ from confluent_kafka import Producer
 from schemas import (
     BiometricEvent, Vitals, Activity, Sleep, Environment,
     DeviceSource, Posture, SleepStage,
-    NORMAL_RANGES, ANOMALY_PATTERNS
+    NORMAL_RANGES, ANOMALY_PATTERNS,
+    SOURCE_PROFILES, SourceProfile, FIELD_SOURCES
 )
+from ground_truth import get_ground_truth, PhysiologicalState, GroundTruthState
 
 
 # Source-specific configurations
@@ -550,40 +557,77 @@ class BiometricProducer:
 
 class MultiSourceProducer:
     """
-    Multi-source biometric producer that publishes to separate Kafka topics
-    for each health data source (Apple, Google, Oura).
+    Multi-source biometric producer using Ground Truth architecture.
+    
+    All sources observe a single evolving PhysiologicalState, ensuring
+    consistent data across sources at similar timestamps. Each source
+    adds device-specific noise based on its accuracy profile.
+    
+    Key Features:
+    - Ground truth ensures HR from Apple ≈ HR from Google
+    - Each source only reports fields it supports (Oura has no HR)
+    - Device-specific noise levels for realistic simulation
+    - Anomaly injection affects all sources via ground truth
     """
     
     def __init__(
         self,
         bootstrap_servers: str = "kafka:29092",
         user_id: str = "user_001",
-        base_interval_ms: int = 500,
+        base_interval_ms: int = 1000,
     ):
         self.bootstrap_servers = bootstrap_servers
         self.user_id = user_id
         self.base_interval_ms = base_interval_ms
         self.running = False
         
-        # Source states - all enabled by default
-        self.sources = {
-            source_id: {**config, "enabled": True, "events_generated": 0}
-            for source_id, config in SOURCE_CONFIGS.items()
-        }
+        # Get ground truth state machine
+        self.ground_truth = get_ground_truth(user_id)
         
-        # Single underlying producer for efficiency
-        self.producer = BiometricProducer(
-            bootstrap_servers=bootstrap_servers,
-            user_id=user_id,
-            interval_ms=base_interval_ms,
-        )
+        # Source states using new SOURCE_PROFILES
+        self.sources: Dict[str, Dict[str, Any]] = {}
+        for source_id, profile in SOURCE_PROFILES.items():
+            self.sources[source_id] = {
+                "profile": profile,
+                "enabled": True,
+                "events_generated": 0,
+                "last_sample_time": 0,
+            }
+        
+        # Kafka producer
+        self.producer_config = {
+            'bootstrap.servers': bootstrap_servers,
+            'client.id': f'telara-generator-{user_id}',
+            'acks': 'all',
+        }
+        self.producer: Optional[Producer] = None
         
         # Locks for thread safety
         self._lock = threading.Lock()
+        
+        # Anomaly tracking (delegated to ground truth)
+        self.anomaly_active: Optional[str] = None
     
     def connect(self) -> bool:
         """Connect to Kafka."""
-        return self.producer.connect()
+        max_retries = 30
+        retry_delay = 2
+        
+        for attempt in range(max_retries):
+            try:
+                print(f"[{attempt + 1}/{max_retries}] Connecting to Kafka at {self.bootstrap_servers}...")
+                self.producer = Producer(self.producer_config)
+                self.producer.list_topics(timeout=5)
+                print(f"✓ Connected to Kafka successfully!")
+                return True
+            except Exception as e:
+                print(f"  Connection failed: {e}")
+                if attempt < max_retries - 1:
+                    print(f"  Retrying in {retry_delay}s...")
+                    time.sleep(retry_delay)
+        
+        print("✗ Max retries reached. Could not connect to Kafka.")
+        return False
     
     def enable_source(self, source_id: str) -> bool:
         """Enable a data source."""
@@ -608,59 +652,119 @@ class MultiSourceProducer:
         with self._lock:
             return {
                 source_id: {
-                    "id": source["id"],
-                    "name": source["name"],
-                    "topic": source["topic"],
+                    "id": source["profile"].id,
+                    "name": source["profile"].name,
+                    "topic": source["profile"].topic,
                     "enabled": source["enabled"],
                     "events_generated": source["events_generated"],
-                    "data_types": source["data_types"],
+                    "supported_fields": list(source["profile"].supported_fields),
                 }
                 for source_id, source in self.sources.items()
             }
     
     def inject_anomaly(self, anomaly_type: str, duration_seconds: int = 30):
-        """Inject an anomaly that affects all sources."""
-        self.producer.inject_anomaly(anomaly_type, duration_seconds)
+        """Inject an anomaly into the ground truth (affects all sources)."""
+        self.ground_truth.inject_anomaly(anomaly_type, duration_seconds)
+        self.anomaly_active = anomaly_type
+    
+    def sample_from_ground_truth(self, profile: SourceProfile) -> Dict[str, Any]:
+        """
+        Sample the current ground truth state through a device's "lens".
+        
+        Each device:
+        - Only reports fields it supports
+        - Adds device-specific noise to values
+        - Has its own sampling characteristics
+        """
+        # Get current ground truth state
+        state = self.ground_truth.get_current_state()
+        state_dict = state.to_dict()
+        
+        # Build event with only fields this source supports
+        event = {
+            "event_id": str(uuid.uuid4()),
+            "timestamp": state.timestamp,
+            "user_id": self.user_id,
+            "source": profile.id,
+            "source_name": profile.name,
+            "device_sources": [profile.device_source],
+        }
+        
+        # Sample each supported field with device-specific noise
+        for field in profile.supported_fields:
+            if field in state_dict:
+                ground_truth_value = state_dict[field]
+                # Add device-specific noise
+                sampled_value = profile.sample_field(field, ground_truth_value)
+                if sampled_value is not None:
+                    # Round appropriately based on field type
+                    if field in ["heart_rate", "hrv_ms", "respiratory_rate", "activity_level", "steps_per_minute", "spo2_percent", "sleep_quality"]:
+                        event[field] = round(sampled_value)
+                    else:
+                        event[field] = round(sampled_value, 2)
+        
+        return event
     
     def generate_and_publish(self):
-        """Generate events for all enabled sources and publish to their topics."""
-        with self._lock:
-            enabled_sources = [s for s in self.sources.values() if s["enabled"]]
+        """
+        Generate events for all enabled sources by sampling ground truth.
         
-        for source_config in enabled_sources:
+        All sources sample the same underlying state, ensuring consistent
+        values across sources at similar times.
+        """
+        current_time = time.time()
+        
+        with self._lock:
+            enabled_sources = [
+                (source_id, source) 
+                for source_id, source in self.sources.items() 
+                if source["enabled"]
+            ]
+        
+        if not enabled_sources:
+            return
+        
+        for source_id, source_state in enabled_sources:
+            profile = source_state["profile"]
+            
+            # Check if it's time for this source to sample
+            # (Each source has its own sampling interval)
+            last_sample = source_state["last_sample_time"]
+            interval_sec = profile.sample_interval_ms / 1000.0
+            
+            if current_time - last_sample < interval_sec:
+                continue  # Not time yet for this source
+            
             try:
-                # Generate source-specific event
-                event = self.producer.generate_source_event(source_config)
-                
-                # Add source identifier to the flat dict
-                event_dict = event.to_flat_dict()
-                event_dict["source"] = source_config["id"]
-                event_dict["source_name"] = source_config["name"]
+                # Sample ground truth through this device's lens
+                event = self.sample_from_ground_truth(profile)
                 
                 # Publish to source-specific topic
-                payload = json.dumps(event_dict)
-                self.producer.producer.produce(
-                    topic=source_config["topic"],
-                    key=event.user_id.encode('utf-8'),
+                payload = json.dumps(event)
+                self.producer.produce(
+                    topic=profile.topic,
+                    key=self.user_id.encode('utf-8'),
                     value=payload.encode('utf-8'),
-                    callback=self.producer.delivery_callback,
                 )
-                self.producer.producer.poll(0)
+                self.producer.poll(0)
                 
                 # Update stats
                 with self._lock:
-                    self.sources[source_config["id"]]["events_generated"] += 1
+                    self.sources[source_id]["events_generated"] += 1
+                    self.sources[source_id]["last_sample_time"] = current_time
                 
             except Exception as e:
-                print(f"✗ Error publishing to {source_config['topic']}: {e}")
+                print(f"✗ Error publishing to {profile.topic}: {e}")
     
     def print_status(self):
         """Print current status to console."""
         with self._lock:
-            enabled = [s["id"] for s in self.sources.values() if s["enabled"]]
+            enabled = [s["profile"].id for s in self.sources.values() if s["enabled"]]
             total_events = sum(s["events_generated"] for s in self.sources.values())
         
-        anomaly_indicator = f" ⚠ [{self.producer.anomaly_active}]" if self.producer.anomaly_active else ""
+        anomaly_status = self.ground_truth.get_anomaly_status()
+        anomaly_indicator = f" ⚠ [{anomaly_status['type']}]" if anomaly_status["active"] else ""
+        
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
         print(f"[{timestamp}] Sources: {','.join(enabled)} | Events: {total_events}{anomaly_indicator}")
     
@@ -670,32 +774,38 @@ class MultiSourceProducer:
             return
         
         self.running = True
-        self.producer.running = True
         
+        # Print startup info
         print(f"\n{'='*60}")
-        print(f"TELARA MULTI-SOURCE DATA GENERATOR STARTED")
+        print(f"TELARA GROUND TRUTH DATA GENERATOR")
         print(f"  User: {self.user_id}")
-        print(f"  Base Interval: {self.base_interval_ms}ms")
+        print(f"  Architecture: Ground Truth + Device Lens")
         print(f"  Sources:")
-        for source in self.sources.values():
+        for source_id, source in self.sources.items():
+            profile = source["profile"]
             status = "✓" if source["enabled"] else "✗"
-            print(f"    {status} {source['name']} -> {source['topic']}")
+            fields = ", ".join(sorted(profile.supported_fields)[:4]) + "..."
+            print(f"    {status} {profile.icon} {profile.name}")
+            print(f"        Topic: {profile.topic}")
+            print(f"        Fields: {fields}")
+            print(f"        Interval: {profile.sample_interval_ms}ms")
         print(f"{'='*60}\n")
         
-        interval_sec = self.base_interval_ms / 1000.0
+        # Main loop - run at high frequency, let sources sample at their own rate
+        loop_interval = 0.1  # 100ms loop for responsive sampling
         last_print_time = 0
         
         while self.running:
             try:
                 self.generate_and_publish()
                 
-                # Print status every 5 seconds
+                # Print status every 10 seconds
                 current_time = time.time()
-                if current_time - last_print_time >= 5:
+                if current_time - last_print_time >= 10:
                     self.print_status()
                     last_print_time = current_time
                 
-                time.sleep(interval_sec)
+                time.sleep(loop_interval)
                 
             except KeyboardInterrupt:
                 break
@@ -708,59 +818,67 @@ class MultiSourceProducer:
     def shutdown(self):
         """Clean shutdown."""
         self.running = False
-        self.producer.running = False
         
         print(f"\n{'='*60}")
-        print(f"TELARA MULTI-SOURCE DATA GENERATOR SHUTDOWN")
-        for source in self.sources.values():
-            print(f"  {source['name']}: {source['events_generated']} events")
+        print(f"TELARA GROUND TRUTH DATA GENERATOR SHUTDOWN")
+        for source_id, source in self.sources.items():
+            profile = source["profile"]
+            print(f"  {profile.icon} {profile.name}: {source['events_generated']} events")
         print(f"{'='*60}")
         
-        if self.producer.producer:
-            self.producer.producer.flush(timeout=5)
+        if self.producer:
+            self.producer.flush(timeout=5)
 
 
 def generate_historical_data(
     user_id: str = "user_001",
     days: int = 7,
-    events_per_hour: int = 120,
+    events_per_hour: int = 60,
     include_anomalies: bool = True,
     anomaly_probability: float = 0.05,
     pattern: str = "normal"
 ) -> List[Dict[str, Any]]:
     """
-    Generate historical biometric data for the specified number of days.
+    Generate historical biometric data using Ground Truth architecture.
+    
+    Fast bulk generation:
+    - Creates ground truth timeline first
+    - Simulates what each source would have observed
+    - Returns raw events from all sources for database insertion
     
     Args:
         user_id: User ID for the generated data
         days: Number of days of history to generate
-        events_per_hour: Events to generate per hour (default 120 = 2/min)
+        events_per_hour: Events per source per hour (default 60 = 1/min)
         include_anomalies: Whether to randomly include anomalies
         anomaly_probability: Probability of an event being anomalous
         pattern: One of 'normal', 'improving', 'declining', 'variable'
     
     Returns:
-        List of vital event dictionaries ready for database insertion
+        List of raw event dictionaries from all sources
     """
-    producer = BiometricProducer(user_id=user_id)
+    ground_truth = get_ground_truth(user_id)
     events = []
     
     now = datetime.now(timezone.utc)
     anomaly_types = list(ANOMALY_PATTERNS.keys())
     
     print(f"\n{'='*60}")
-    print(f"GENERATING HISTORICAL DATA")
+    print(f"GENERATING HISTORICAL DATA (Ground Truth)")
     print(f"  User: {user_id}")
     print(f"  Days: {days}")
-    print(f"  Events/hour: {events_per_hour}")
+    print(f"  Events/hour per source: {events_per_hour}")
     print(f"  Pattern: {pattern}")
     print(f"  Include anomalies: {include_anomalies}")
+    print(f"  Sources: {', '.join(SOURCE_PROFILES.keys())}")
     print(f"{'='*60}\n")
     
     # Generate data for each day
     for day_offset in range(days, 0, -1):
         day_start = now - timedelta(days=day_offset)
         day_start = day_start.replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        day_events = []
         
         # Generate events for each hour of the day
         for hour in range(24):
@@ -773,33 +891,55 @@ def generate_historical_data(
                 # Calculate exact timestamp
                 event_time = hour_start + timedelta(seconds=event_idx * interval_seconds)
                 
-                # Determine if this event should be anomalous
-                is_anomaly = include_anomalies and random.random() < anomaly_probability
-                anomaly_type = random.choice(anomaly_types) if is_anomaly else None
+                # Get ground truth state at this time
+                state = ground_truth.get_state_at_time(event_time)
+                state_dict = state.to_dict()
                 
-                # Generate the event
-                event = producer.generate_historical_event(
-                    timestamp=event_time,
-                    hour_of_day=hour,
-                    pattern=pattern,
-                    day_offset=-day_offset,
-                    include_anomaly=is_anomaly,
-                    anomaly_type=anomaly_type
-                )
-                events.append(event)
+                # Determine if this should be an anomaly period
+                is_anomaly = include_anomalies and random.random() < anomaly_probability
+                if is_anomaly:
+                    anomaly_type = random.choice(anomaly_types)
+                    # Apply anomaly modifiers to state
+                    if anomaly_type in ANOMALY_PATTERNS:
+                        pattern_data = ANOMALY_PATTERNS[anomaly_type]
+                        for field, (low, high) in pattern_data.items():
+                            if field in state_dict:
+                                state_dict[field] = random.uniform(low, high)
+                
+                # Generate event for each source by sampling this state
+                for source_id, profile in SOURCE_PROFILES.items():
+                    event = {
+                        "event_id": str(uuid.uuid4()),
+                        "timestamp": event_time.isoformat(),
+                        "user_id": user_id,
+                        "source": source_id,
+                        "source_name": profile.name,
+                    }
+                    
+                    # Sample each supported field with device noise
+                    for field in profile.supported_fields:
+                        if field in state_dict:
+                            value = state_dict[field]
+                            sampled = profile.sample_field(field, value)
+                            if sampled is not None:
+                                if field in ["heart_rate", "hrv_ms", "respiratory_rate", 
+                                            "activity_level", "steps_per_minute", "spo2_percent"]:
+                                    event[field] = round(sampled)
+                                else:
+                                    event[field] = round(sampled, 2)
+                    
+                    day_events.append(event)
         
-        print(f"  Generated day {days - day_offset + 1}/{days}: {day_start.date()}")
+        events.extend(day_events)
+        print(f"  Generated day {days - day_offset + 1}/{days}: {day_start.date()} ({len(day_events)} events)")
     
     total_events = len(events)
-    anomaly_count = sum(1 for e in events if e.get("heart_rate", 0) > 100 or e.get("spo2_percent", 100) < 95)
-    
-    print(f"\n✓ Generated {total_events} events")
-    print(f"  Estimated anomalies: {anomaly_count}")
+    print(f"\n✓ Generated {total_events} events across {len(SOURCE_PROFILES)} sources")
     
     return events
 
 
-def setup_anomaly_trigger(producer: BiometricProducer):
+def setup_anomaly_trigger(producer: MultiSourceProducer):
     """Set up automatic anomaly injection for demo purposes."""
     def trigger_loop():
         time.sleep(60)  # Wait 1 minute before first anomaly
@@ -827,59 +967,30 @@ def main():
     """Entry point for the data generator."""
     # Configuration from environment
     bootstrap_servers = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092")
-    interval_ms = int(os.environ.get("EVENT_INTERVAL_MS", "500"))
     user_id = os.environ.get("USER_ID", "user_001")
     auto_anomaly = os.environ.get("AUTO_ANOMALY", "true").lower() == "true"
-    multi_source = os.environ.get("MULTI_SOURCE", "true").lower() == "true"
     
-    if multi_source:
-        # Use multi-source producer (publishes to separate topics per source)
-        producer = MultiSourceProducer(
-            bootstrap_servers=bootstrap_servers,
-            user_id=user_id,
-            base_interval_ms=interval_ms,
-        )
-        
-        # Handle shutdown signals
-        def signal_handler(signum, frame):
-            print("\nReceived shutdown signal...")
-            producer.running = False
-        
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
-        
-        # Start automatic anomaly injection for demo
-        if auto_anomaly:
-            print("Auto-anomaly injection enabled. First anomaly in 60 seconds.")
-            setup_anomaly_trigger(producer.producer)
-        
-        # Run the multi-source producer
-        producer.run()
-    else:
-        # Legacy single-topic mode
-        topic = os.environ.get("KAFKA_TOPIC", "biometrics-raw")
-        producer = BiometricProducer(
-            bootstrap_servers=bootstrap_servers,
-            topic=topic,
-            user_id=user_id,
-            interval_ms=interval_ms,
-        )
-        
-        # Handle shutdown signals
-        def signal_handler(signum, frame):
-            print("\nReceived shutdown signal...")
-            producer.running = False
-        
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
-        
-        # Start automatic anomaly injection for demo
-        if auto_anomaly:
-            print("Auto-anomaly injection enabled. First anomaly in 60 seconds.")
-            setup_anomaly_trigger(producer)
-        
-        # Run the producer
-        producer.run()
+    # Always use multi-source ground truth producer
+    producer = MultiSourceProducer(
+        bootstrap_servers=bootstrap_servers,
+        user_id=user_id,
+    )
+    
+    # Handle shutdown signals
+    def signal_handler(signum, frame):
+        print("\nReceived shutdown signal...")
+        producer.running = False
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # Start automatic anomaly injection for demo
+    if auto_anomaly:
+        print("Auto-anomaly injection enabled. First anomaly in 60 seconds.")
+        setup_anomaly_trigger(producer)
+    
+    # Run the multi-source ground truth producer
+    producer.run()
 
 
 # Global multi-source producer for control server access

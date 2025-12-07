@@ -170,7 +170,9 @@ class MultiSourceKafkaConsumer:
                         time.sleep(0.5)
                         continue
                 
-                msg = consumer.poll(timeout=0.5)
+                # Reduced poll timeout (100ms) for smoother real-time delivery
+                # Lower timeout = less batching = more even event distribution to UI
+                msg = consumer.poll(timeout=0.1)
                 
                 if msg is None:
                     continue
@@ -215,7 +217,8 @@ class MultiSourceKafkaConsumer:
         
         while self.running:
             try:
-                msg = consumer.poll(timeout=0.5)
+                # Reduced poll timeout (100ms) for smoother real-time delivery
+                msg = consumer.poll(timeout=0.1)
                 
                 if msg is None:
                     continue

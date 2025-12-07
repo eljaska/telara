@@ -155,13 +155,16 @@ def get_status():
     p = get_multi_producer()
     sources = p.get_source_status()
     
+    # Get anomaly status from ground truth
+    anomaly_status = p.ground_truth.get_anomaly_status() if hasattr(p, 'ground_truth') else {"active": False, "type": None}
+    
     return jsonify({
         "running": p.running,
         "mode": "multi-source",
         "user_id": p.user_id,
         "interval_ms": p.base_interval_ms,
-        "anomaly_active": p.producer.anomaly_active,
-        "anomaly_end_time": p.producer.anomaly_end_time,
+        "anomaly_active": anomaly_status.get("active", False),
+        "anomaly_type": anomaly_status.get("type"),
         "sources": sources,
         "total_events": sum(s["events_generated"] for s in sources.values()),
     })
@@ -182,7 +185,7 @@ def start_generator():
             })
         
         # Connect if not connected
-        if not p.producer.producer:
+        if not p.producer:
             if not p.connect():
                 return jsonify({
                     "status": "error",
@@ -191,7 +194,6 @@ def start_generator():
         
         # Start in background thread
         p.running = True
-        p.producer.running = True
         producer_thread = threading.Thread(target=run_multi_producer_loop, daemon=True)
         producer_thread.start()
         
@@ -215,7 +217,6 @@ def stop_generator():
             })
         
         p.running = False
-        p.producer.running = False
         
         return jsonify({
             "status": "stopped",
