@@ -66,7 +66,9 @@ def create_tachycardia_detection_query() -> str:
     - heart_rate > 100 bpm
     - activity_level < 10 (sedentary)
     - steps_per_minute < 5 (at rest)
-    - All within 1 minute window
+    
+    Note: Pattern uses reluctant quantifier A{5,}? and ends with B to avoid
+    the "greedy quantifier as last element" limitation in Flink.
     """
     return """
     INSERT INTO biometrics_alerts
@@ -95,9 +97,10 @@ def create_tachycardia_detection_query() -> str:
             COUNT(A.event_id) AS match_count
         ONE ROW PER MATCH
         AFTER MATCH SKIP PAST LAST ROW
-        PATTERN (A{5,})
+        PATTERN (A{5,}? B)
         DEFINE
-            A AS A.heart_rate > 100 AND A.activity_level < 10 AND A.steps_per_minute < 5
+            A AS A.heart_rate > 100 AND A.activity_level < 10 AND A.steps_per_minute < 5,
+            B AS B.heart_rate <= 100 OR B.activity_level >= 10 OR B.steps_per_minute >= 5
     ) AS T
     """
 
@@ -135,9 +138,10 @@ def create_hypoxia_detection_query() -> str:
             COUNT(A.event_id) AS match_count
         ONE ROW PER MATCH
         AFTER MATCH SKIP PAST LAST ROW
-        PATTERN (A{3,})
+        PATTERN (A{3,}? B)
         DEFINE
-            A AS A.spo2_percent < 94
+            A AS A.spo2_percent < 94,
+            B AS B.spo2_percent >= 94
     ) AS T
     """
 
@@ -175,9 +179,10 @@ def create_fever_detection_query() -> str:
             COUNT(A.event_id) AS match_count
         ONE ROW PER MATCH
         AFTER MATCH SKIP PAST LAST ROW
-        PATTERN (A{3,})
+        PATTERN (A{3,}? B)
         DEFINE
-            A AS A.skin_temp_c > 37.5
+            A AS A.skin_temp_c > 37.5,
+            B AS B.skin_temp_c <= 37.5
     ) AS T
     """
 
@@ -234,4 +239,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

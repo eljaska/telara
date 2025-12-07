@@ -1,10 +1,16 @@
 /**
  * Main Dashboard Component
+ * Integrates all health monitoring components
  */
 
+import { useState } from 'react';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { VitalChart } from './VitalChart';
 import { ThreatLog } from './ThreatLog';
+import { WellnessGauge } from './WellnessGauge';
+import { HealthChat } from './HealthChat';
+import { Timeline } from './Timeline';
+import { ControlPanel } from './ControlPanel';
 import { 
   Activity, 
   Wifi, 
@@ -15,8 +21,16 @@ import {
   Droplets,
   Zap,
   Clock,
-  TrendingUp
+  TrendingUp,
+  MessageSquare,
+  Settings,
+  LayoutGrid
 } from 'lucide-react';
+
+// API URLs from environment or defaults
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws/vitals';
+const CHAT_WS_URL = import.meta.env.VITE_CHAT_WS_URL || 'ws://localhost:8000/ws/chat';
 
 function ConnectionStatus({ 
   status, 
@@ -84,8 +98,12 @@ function VitalIndicator({
   );
 }
 
+type ViewMode = 'dashboard' | 'chat' | 'control';
+
 export function Dashboard() {
   const { vitals, alerts, latestVital, connectionState, eventsPerSecond } = useWebSocket(100);
+  const [viewMode, setViewMode] = useState<ViewMode>('dashboard');
+  const [showChat, setShowChat] = useState(true);
   
   const formatTime = () => {
     return new Date().toLocaleTimeString('en-US', {
@@ -117,6 +135,43 @@ export function Dashboard() {
                   HEALTH SECURITY OPERATIONS CENTER
                 </p>
               </div>
+            </div>
+            
+            {/* View Mode Toggles */}
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setViewMode('dashboard')}
+                className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm transition-colors ${
+                  viewMode === 'dashboard'
+                    ? 'bg-accent-cyan/20 text-accent-cyan'
+                    : 'text-soc-muted hover:text-soc-text'
+                }`}
+              >
+                <LayoutGrid size={16} />
+                Dashboard
+              </button>
+              <button
+                onClick={() => setShowChat(!showChat)}
+                className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm transition-colors ${
+                  showChat
+                    ? 'bg-accent-purple/20 text-accent-purple'
+                    : 'text-soc-muted hover:text-soc-text'
+                }`}
+              >
+                <MessageSquare size={16} />
+                AI Coach
+              </button>
+              <button
+                onClick={() => setViewMode(viewMode === 'control' ? 'dashboard' : 'control')}
+                className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm transition-colors ${
+                  viewMode === 'control'
+                    ? 'bg-vital-warning/20 text-vital-warning'
+                    : 'text-soc-muted hover:text-soc-text'
+                }`}
+              >
+                <Settings size={16} />
+                Control
+              </button>
             </div>
             
             {/* Connection Status & Time */}
@@ -183,10 +238,24 @@ export function Dashboard() {
         </div>
 
         {/* Main Grid */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          {/* Charts Panel - 2 columns */}
+        <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
+          {/* Left Column - Wellness Score & Control */}
+          <div className="lg:col-span-1 space-y-4">
+            <WellnessGauge apiUrl={API_URL} />
+            
+            {viewMode === 'control' && (
+              <ControlPanel apiUrl={API_URL} />
+            )}
+            
+            <Timeline 
+              vitals={vitals}
+              alerts={alerts}
+              selectedMetric="heart_rate"
+            />
+          </div>
+
+          {/* Center Column - Charts */}
           <div className="lg:col-span-2 space-y-4">
-            {/* Primary Charts Row */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <VitalChart
                 data={vitals}
@@ -208,7 +277,6 @@ export function Dashboard() {
               />
             </div>
             
-            {/* Secondary Charts Row */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <VitalChart
                 data={vitals}
@@ -216,8 +284,6 @@ export function Dashboard() {
                 title="Blood Oxygen (SpO2)"
                 unit="%"
                 color="#58a6ff"
-                warningThreshold={undefined}
-                criticalThreshold={undefined}
                 normalRange={[95, 100]}
               />
               <VitalChart
@@ -246,19 +312,30 @@ export function Dashboard() {
                   </div>
                   <div className="flex items-center gap-2">
                     <div className="w-2 h-2 rounded-full bg-vital-normal live-indicator" />
-                    <span className="text-soc-muted">WebSocket</span>
+                    <span className="text-soc-muted">Claude AI</span>
                   </div>
                 </div>
                 <div className="text-soc-muted font-mono">
-                  Events buffered: {vitals.length} | Active patterns: 3
+                  Buffered: {vitals.length} vitals | {alerts.length} alerts
                 </div>
               </div>
             </div>
           </div>
 
-          {/* Threat Log Panel - 1 column */}
-          <div className="lg:col-span-1 h-[600px]">
-            <ThreatLog alerts={alerts} />
+          {/* Right Column - Threat Log & Chat */}
+          <div className="lg:col-span-1 space-y-4">
+            {showChat ? (
+              <div className="h-[400px]">
+                <HealthChat 
+                  wsUrl={CHAT_WS_URL}
+                  apiUrl={API_URL}
+                />
+              </div>
+            ) : null}
+            
+            <div className={showChat ? 'h-[300px]' : 'h-[600px]'}>
+              <ThreatLog alerts={alerts} />
+            </div>
           </div>
         </div>
       </main>
@@ -267,8 +344,8 @@ export function Dashboard() {
       <footer className="border-t border-soc-border bg-soc-panel/50 mt-8">
         <div className="container mx-auto px-6 py-3">
           <div className="flex items-center justify-between text-xs text-soc-muted">
-            <span>TELARA v1.0 | Palo Alto Networks Hackathon 2025</span>
-            <span>Powered by Apache Kafka + Flink + FastAPI + React</span>
+            <span>TELARA v2.0 | Palo Alto Networks Hackathon 2025</span>
+            <span>Powered by Kafka + Flink + Claude AI + React</span>
           </div>
         </div>
       </footer>

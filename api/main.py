@@ -1,26 +1,50 @@
 """
 Telara API Server
-FastAPI application with WebSocket support for real-time biometrics streaming.
+FastAPI application with WebSocket support for real-time biometrics streaming
+and AI-powered health coaching.
 """
 
 import asyncio
 import json
 import os
+import httpx
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Set
+from typing import Set, Optional
+from uuid import uuid4
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from kafka_consumer import KafkaStreamConsumer, MessageBuffer
+from database import (
+    init_database,
+    VitalsRepository,
+    AlertsRepository,
+    BaselinesRepository
+)
+from claude_agent import get_agent, HealthCoachAgent
+from wellness import calculate_wellness_score, get_wellness_recommendations
 
 
 # Configuration
 KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092")
 KAFKA_RAW_TOPIC = os.environ.get("KAFKA_RAW_TOPIC", "biometrics-raw")
 KAFKA_ALERTS_TOPIC = os.environ.get("KAFKA_ALERTS_TOPIC", "biometrics-alerts")
+GENERATOR_CONTROL_URL = os.environ.get("GENERATOR_CONTROL_URL", "http://data-generator:8001")
+
+
+# Pydantic models
+class ChatMessage(BaseModel):
+    message: str
+    session_id: Optional[str] = None
+
+
+class AnomalyInjectRequest(BaseModel):
+    anomaly_type: str
+    duration_seconds: int = 30
 
 
 # Global state
@@ -29,6 +53,7 @@ class ConnectionManager:
     
     def __init__(self):
         self.active_connections: Set[WebSocket] = set()
+        self.chat_connections: dict[str, WebSocket] = {}
         self.message_buffer = MessageBuffer()
         self.stats = {
             "total_vitals": 0,
@@ -53,6 +78,15 @@ class ConnectionManager:
         self.active_connections.discard(websocket)
         print(f"WebSocket disconnected. Active connections: {len(self.active_connections)}")
     
+    async def connect_chat(self, websocket: WebSocket, session_id: str):
+        """Accept a chat WebSocket connection."""
+        await websocket.accept()
+        self.chat_connections[session_id] = websocket
+    
+    def disconnect_chat(self, session_id: str):
+        """Disconnect a chat session."""
+        self.chat_connections.pop(session_id, None)
+    
     async def broadcast(self, message: dict):
         """Broadcast a message to all connected clients."""
         if not self.active_connections:
@@ -61,11 +95,16 @@ class ConnectionManager:
         # Update buffer
         self.message_buffer.add_message(message)
         
+        # Store to database
+        await self._store_message(message)
+        
         # Update stats
         if message["type"] == "vital":
             self.stats["total_vitals"] += 1
         elif message["type"] == "alert":
             self.stats["total_alerts"] += 1
+            # Enrich alert with AI insight
+            asyncio.create_task(self._enrich_alert(message["data"]))
         
         # Broadcast to all connections
         disconnected = set()
@@ -79,6 +118,39 @@ class ConnectionManager:
         # Clean up disconnected clients
         for conn in disconnected:
             self.active_connections.discard(conn)
+    
+    async def _store_message(self, message: dict):
+        """Store message to database."""
+        try:
+            if message["type"] == "vital":
+                await VitalsRepository.insert(message["data"])
+            elif message["type"] == "alert":
+                await AlertsRepository.insert(message["data"])
+        except Exception as e:
+            print(f"Error storing message: {e}")
+    
+    async def _enrich_alert(self, alert_data: dict):
+        """Enrich alert with AI-generated insight."""
+        try:
+            agent = await get_agent()
+            insight = await agent.generate_alert_insight(alert_data)
+            
+            if insight:
+                # Update in database
+                await AlertsRepository.update_insight(alert_data.get("alert_id"), insight)
+                
+                # Broadcast enriched alert
+                enriched_alert = {**alert_data, "ai_insight": insight}
+                for connection in self.active_connections:
+                    try:
+                        await connection.send_json({
+                            "type": "alert_enriched",
+                            "data": enriched_alert
+                        })
+                    except:
+                        pass
+        except Exception as e:
+            print(f"Error enriching alert: {e}")
 
 
 # Global instances
@@ -97,6 +169,9 @@ async def lifespan(app: FastAPI):
     print(f"  Raw Topic: {KAFKA_RAW_TOPIC}")
     print(f"  Alerts Topic: {KAFKA_ALERTS_TOPIC}")
     print("=" * 60)
+    
+    # Initialize database
+    await init_database()
     
     # Initialize Kafka consumer
     kafka_consumer = KafkaStreamConsumer(
@@ -124,8 +199,8 @@ async def lifespan(app: FastAPI):
 # Create FastAPI app
 app = FastAPI(
     title="Telara API",
-    description="Personal Health SOC - Real-time biometrics streaming API",
-    version="1.0.0",
+    description="Personal Health SOC - Real-time biometrics streaming with AI insights",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -139,12 +214,16 @@ app.add_middleware(
 )
 
 
-# REST Endpoints
+# ==============================================================================
+# REST Endpoints - Health & Stats
+# ==============================================================================
+
 @app.get("/")
 async def root():
     """Health check endpoint."""
     return {
         "service": "Telara API",
+        "version": "2.0.0",
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
     }
@@ -176,23 +255,142 @@ async def get_stats():
     }
 
 
-@app.get("/alerts/recent")
-async def get_recent_alerts(limit: int = 20):
-    """Get recent alerts from buffer."""
-    alerts = manager.message_buffer.get_recent_alerts(limit)
+# ==============================================================================
+# REST Endpoints - Data Queries
+# ==============================================================================
+
+@app.get("/vitals/recent")
+async def get_recent_vitals(minutes: int = Query(default=30, le=1440)):
+    """Get recent vital readings."""
+    vitals = await VitalsRepository.get_recent(minutes=minutes)
     return {
-        "count": len(alerts),
-        "alerts": [a["data"] for a in alerts],
+        "count": len(vitals),
+        "period_minutes": minutes,
+        "vitals": vitals
     }
 
 
-@app.post("/anomaly/inject/{anomaly_type}")
-async def inject_anomaly(anomaly_type: str, duration: int = 30):
-    """
-    API endpoint to trigger anomaly injection in the data generator.
-    Note: This requires the data generator to expose an HTTP endpoint.
-    For the hackathon, anomalies are auto-triggered in the generator.
-    """
+@app.get("/vitals/stats")
+async def get_vital_stats(hours: int = Query(default=24, le=168)):
+    """Get vital statistics."""
+    stats = await VitalsRepository.get_stats(hours=hours)
+    return stats
+
+
+@app.get("/alerts/recent")
+async def get_recent_alerts(
+    hours: int = Query(default=24, le=168),
+    severity: Optional[str] = None
+):
+    """Get recent alerts from database."""
+    alerts = await AlertsRepository.get_recent(hours=hours, severity=severity)
+    return {
+        "count": len(alerts),
+        "alerts": alerts,
+    }
+
+
+@app.get("/alerts/summary")
+async def get_alert_summary(hours: int = Query(default=24, le=168)):
+    """Get alert summary by severity."""
+    counts = await AlertsRepository.get_count_by_severity(hours=hours)
+    return counts
+
+
+# ==============================================================================
+# REST Endpoints - Wellness Score
+# ==============================================================================
+
+@app.get("/wellness/score")
+async def get_wellness_score():
+    """Get current wellness score with breakdown."""
+    vitals = await VitalsRepository.get_recent(minutes=60)
+    alerts = await AlertsRepository.get_recent(hours=24)
+    baseline = await BaselinesRepository.get()
+    
+    score, breakdown = await calculate_wellness_score(vitals, alerts, baseline)
+    recommendations = get_wellness_recommendations(score, breakdown)
+    
+    return {
+        "score": score,
+        "breakdown": breakdown,
+        "recommendations": recommendations,
+        "calculated_at": datetime.utcnow().isoformat()
+    }
+
+
+@app.get("/wellness/baseline")
+async def get_baseline():
+    """Get user baseline data."""
+    baseline = await BaselinesRepository.get()
+    return baseline or {"message": "No baseline established yet"}
+
+
+# ==============================================================================
+# REST Endpoints - Chat (non-streaming)
+# ==============================================================================
+
+@app.post("/chat")
+async def chat_endpoint(request: ChatMessage):
+    """Send a message to the health coach and get a response."""
+    session_id = request.session_id or str(uuid4())
+    
+    try:
+        agent = await get_agent()
+        result = await agent.chat(session_id, request.message)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/chat/{session_id}")
+async def clear_chat_session(session_id: str):
+    """Clear a chat session."""
+    agent = await get_agent()
+    agent.clear_session(session_id)
+    return {"message": "Session cleared"}
+
+
+# ==============================================================================
+# REST Endpoints - Generator Control
+# ==============================================================================
+
+@app.get("/generator/status")
+async def get_generator_status():
+    """Get data generator status."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(f"{GENERATOR_CONTROL_URL}/status")
+            return response.json()
+    except Exception as e:
+        return {"status": "unknown", "error": str(e)}
+
+
+@app.post("/generator/start")
+async def start_generator():
+    """Start the data generator."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.post(f"{GENERATOR_CONTROL_URL}/start")
+            return response.json()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/generator/stop")
+async def stop_generator():
+    """Stop the data generator."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.post(f"{GENERATOR_CONTROL_URL}/stop")
+            return response.json()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/generator/inject/{anomaly_type}")
+async def inject_anomaly(anomaly_type: str, duration: int = Query(default=30, le=120)):
+    """Inject a specific anomaly pattern."""
     valid_types = ["tachycardia_at_rest", "hypoxia", "fever_onset", "burnout_stress", "dehydration"]
     
     if anomaly_type not in valid_types:
@@ -201,44 +399,51 @@ async def inject_anomaly(anomaly_type: str, duration: int = 30):
             detail=f"Invalid anomaly type. Valid types: {valid_types}"
         )
     
-    # In a full implementation, this would call the data generator
-    return {
-        "message": f"Anomaly injection requested: {anomaly_type}",
-        "duration": duration,
-        "note": "Auto-anomaly injection is enabled in the data generator",
-    }
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.post(
+                f"{GENERATOR_CONTROL_URL}/inject",
+                json={"anomaly_type": anomaly_type, "duration_seconds": duration}
+            )
+            return response.json()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-# WebSocket Endpoint
+# ==============================================================================
+# WebSocket Endpoints
+# ==============================================================================
+
 @app.websocket("/ws/vitals")
 async def websocket_vitals(websocket: WebSocket):
     """
     WebSocket endpoint for real-time biometrics streaming.
     
     Message format (outbound):
-    - {"type": "vital", "data": {...}}  - Real-time vital signs
-    - {"type": "alert", "data": {...}}  - Anomaly alerts from Flink
-    - {"type": "initial_state", "data": {"vitals": [...], "alerts": [...]}}
+    - {"type": "vital", "data": {...}}
+    - {"type": "alert", "data": {...}}
+    - {"type": "alert_enriched", "data": {...}} - Alert with AI insight
+    - {"type": "initial_state", "data": {...}}
     """
     await manager.connect(websocket)
     
     try:
         while True:
-            # Keep connection alive and handle client messages
             try:
                 data = await asyncio.wait_for(
                     websocket.receive_text(),
                     timeout=30.0
                 )
                 
-                # Handle ping/pong
                 if data == "ping":
                     await websocket.send_text("pong")
                     
             except asyncio.TimeoutError:
-                # Send heartbeat
                 try:
-                    await websocket.send_json({"type": "heartbeat", "timestamp": datetime.utcnow().isoformat()})
+                    await websocket.send_json({
+                        "type": "heartbeat",
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
                 except:
                     break
                     
@@ -250,15 +455,95 @@ async def websocket_vitals(websocket: WebSocket):
         manager.disconnect(websocket)
 
 
-# Alternative WebSocket for alerts only
+@app.websocket("/ws/chat")
+async def websocket_chat(websocket: WebSocket):
+    """
+    WebSocket endpoint for streaming chat with health coach.
+    
+    Client sends: {"message": "...", "session_id": "..."}
+    Server sends: 
+      - {"type": "thinking", "tool": "..."} - When agent uses a tool
+      - {"type": "response", "content": "...", "done": false}
+      - {"type": "response", "content": "...", "done": true}
+    """
+    session_id = str(uuid4())
+    await manager.connect_chat(websocket, session_id)
+    
+    try:
+        # Send session ID to client
+        await websocket.send_json({
+            "type": "session_start",
+            "session_id": session_id
+        })
+        
+        agent = await get_agent()
+        
+        while True:
+            data = await websocket.receive_text()
+            
+            try:
+                message = json.loads(data)
+                user_message = message.get("message", "")
+                
+                if not user_message:
+                    continue
+                
+                # Use provided session_id if available
+                sid = message.get("session_id", session_id)
+                
+                # Send thinking indicator
+                await websocket.send_json({
+                    "type": "thinking",
+                    "message": "Analyzing your health data..."
+                })
+                
+                # Get response from agent
+                result = await agent.chat(sid, user_message)
+                
+                # Send tool call info if any
+                for tool_call in result.get("tool_calls", []):
+                    await websocket.send_json({
+                        "type": "tool_use",
+                        "tool": tool_call["tool"],
+                        "preview": tool_call.get("output_preview", "")[:100]
+                    })
+                
+                # Send final response
+                await websocket.send_json({
+                    "type": "response",
+                    "content": result["response"],
+                    "session_id": result["session_id"],
+                    "done": True
+                })
+                
+            except json.JSONDecodeError:
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "Invalid JSON format"
+                })
+                
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        print(f"Chat WebSocket error: {e}")
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "message": str(e)
+            })
+        except:
+            pass
+    finally:
+        manager.disconnect_chat(session_id)
+
+
 @app.websocket("/ws/alerts")
 async def websocket_alerts(websocket: WebSocket):
-    """WebSocket endpoint for alerts only (lighter bandwidth)."""
+    """WebSocket endpoint for alerts only."""
     await websocket.accept()
     
-    # Create a filtered callback for alerts only
     async def alert_callback(message: dict):
-        if message["type"] == "alert":
+        if message["type"] in ["alert", "alert_enriched"]:
             try:
                 await websocket.send_json(message)
             except:
@@ -285,4 +570,3 @@ if __name__ == "__main__":
         reload=False,
         log_level="info",
     )
-

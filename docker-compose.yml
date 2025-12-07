@@ -123,10 +123,15 @@ services:
       dockerfile: Dockerfile
     hostname: data-generator
     container_name: telara-data-generator
+    ports:
+      - "8001:8001"
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       KAFKA_TOPIC: biometrics-raw
       EVENT_INTERVAL_MS: 500
+      AUTO_START: "true"
+      AUTO_ANOMALY: "false"
+      CONTROL_PORT: 8001
     networks:
       - telara-network
     depends_on:
@@ -134,7 +139,7 @@ services:
         condition: service_healthy
 
   # ============================================
-  # API LAYER - FastAPI + WebSockets
+  # API LAYER - FastAPI + WebSockets + AI
   # ============================================
   api:
     build:
@@ -148,6 +153,11 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       KAFKA_RAW_TOPIC: biometrics-raw
       KAFKA_ALERTS_TOPIC: biometrics-alerts
+      GENERATOR_CONTROL_URL: http://data-generator:8001
+      DATABASE_PATH: /app/data/telara.db
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+    volumes:
+      - telara-data:/app/data
     networks:
       - telara-network
     depends_on:
@@ -167,6 +177,7 @@ services:
       - "5173:5173"
     environment:
       VITE_WS_URL: ws://localhost:8000/ws/vitals
+      VITE_CHAT_WS_URL: ws://localhost:8000/ws/chat
       VITE_API_URL: http://localhost:8000
     networks:
       - telara-network
@@ -177,3 +188,5 @@ networks:
   telara-network:
     driver: bridge
 
+volumes:
+  telara-data:

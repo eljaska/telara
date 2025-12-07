@@ -15,7 +15,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY schemas.py .
 COPY producer.py .
+COPY control_server.py .
+COPY entrypoint.py .
 
-# Run the producer
-CMD ["python", "-u", "producer.py"]
+# Expose control server port
+EXPOSE 8001
 
+# Run the entrypoint
+CMD ["python", "-u", "entrypoint.py"]
