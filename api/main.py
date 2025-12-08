@@ -148,24 +148,41 @@ class ConnectionManager:
         if not self.active_connections:
             return
         
-        # Broadcast to all connections in parallel (don't wait for slow clients)
-        async def safe_send(ws: WebSocket) -> WebSocket | None:
-            try:
-                await asyncio.wait_for(ws.send_json(broadcast_message), timeout=1.0)
-                return None
-            except Exception:
-                return ws
+        # Fast non-blocking broadcast with short timeout
+        # Track dead connections to remove after broadcast
+        dead_connections: Set[WebSocket] = set()
         
-        # Send to all clients concurrently with timeout
-        results = await asyncio.gather(
-            *[safe_send(conn) for conn in self.active_connections],
+        async def safe_send(ws: WebSocket) -> None:
+            try:
+                # Check if connection is still open before sending
+                if ws.client_state.value != 1:  # 1 = CONNECTED
+                    dead_connections.add(ws)
+                    return
+                
+                await asyncio.wait_for(ws.send_json(broadcast_message), timeout=0.5)
+            except asyncio.TimeoutError:
+                # Client is slow - don't remove yet, let heartbeat handle it
+                pass
+            except RuntimeError as e:
+                # Connection closed - mark for removal
+                if "close" in str(e).lower():
+                    dead_connections.add(ws)
+            except Exception:
+                # Any other error - mark for removal
+                dead_connections.add(ws)
+        
+        # Get a snapshot of connections to avoid modification during iteration
+        connections = list(self.active_connections)
+        
+        # Send to all clients concurrently
+        await asyncio.gather(
+            *[safe_send(conn) for conn in connections],
             return_exceptions=True
         )
         
-        # Clean up disconnected/slow clients
-        for result in results:
-            if isinstance(result, WebSocket):
-                self.active_connections.discard(result)
+        # Clean up dead connections
+        for ws in dead_connections:
+            self.active_connections.discard(ws)
     
     async def _store_alert(self, alert_data: dict):
         """Store alert to SQLite (alerts are infrequent, so this is fine)."""

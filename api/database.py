@@ -188,6 +188,13 @@ class SpeedLayerAggregator:
         "oura": "💍",
     }
     
+    # Priority order for stable icon display (Apple > Google > Oura)
+    SOURCE_PRIORITY = {
+        "apple": 1,
+        "google": 2,
+        "oura": 3,
+    }
+    
     # Freshness window - values older than this are considered stale
     FRESHNESS_WINDOW_MS = 10000  # 10 seconds
     
@@ -200,9 +207,10 @@ class SpeedLayerAggregator:
             metric: {} for metric in self.AGGREGATABLE_METRICS
         }
         
-        # Cached aggregated state
+        # Cached aggregated state (updated only in add_event, not on every get)
         self._aggregated_state: Dict[str, Dict[str, Any]] = {}
         self._last_update = datetime.utcnow()
+        self._cached_source_count = 0  # Cached count of active sources
     
     def add_event(self, event: Dict[str, Any]) -> None:
         """
@@ -272,38 +280,44 @@ class SpeedLayerAggregator:
             if not fresh_readings:
                 continue
             
-            # Sort by timestamp (most recent first)
+            # Sort by timestamp (most recent first) to get best value
             fresh_readings.sort(key=lambda x: x["timestamp"], reverse=True)
             
             # Best value = most recent
             best = fresh_readings[0]
             
+            # Sort by priority for stable icon display (Apple > Google > Oura)
+            readings_by_priority = sorted(fresh_readings, key=lambda x: self.SOURCE_PRIORITY.get(x["source"], 99))
+            
             new_state[metric] = {
                 "value": best["value"],
-                "sources": [r["source"] for r in fresh_readings],
-                "source_icons": [self.SOURCE_ICONS.get(r["source"], "📊") for r in fresh_readings],
+                "sources": [r["source"] for r in readings_by_priority],
+                "source_icons": [self.SOURCE_ICONS.get(r["source"], "📊") for r in readings_by_priority],
                 "freshness_ms": best["age_ms"],
                 "reading_count": len(fresh_readings),
             }
         
         self._aggregated_state = new_state
         self._last_update = now
+        self._cached_source_count = self._count_active_sources()
     
     def get_aggregated_state(self) -> Dict[str, Any]:
         """
         Get the current aggregated state for display.
         
+        Returns cached state for performance - recomputation happens only in add_event().
+        This prevents blocking on every broadcast.
+        
         Returns:
             Dict with best values, source attribution, and freshness info.
         """
         with self._lock:
-            # Recompute to ensure freshness is current
-            self._recompute_aggregated_state()
-            
+            # Return cached state - do NOT recompute here
+            # Recomputation happens in add_event() when data actually changes
             return {
                 "vitals": self._aggregated_state.copy(),
                 "last_update": self._last_update.isoformat(),
-                "source_count": self._count_active_sources(),
+                "source_count": self._cached_source_count,
             }
     
     def _count_active_sources(self) -> int:
@@ -351,6 +365,7 @@ class SpeedLayerAggregator:
         with self._lock:
             self._latest_by_source = {metric: {} for metric in self.AGGREGATABLE_METRICS}
             self._aggregated_state = {}
+            self._cached_source_count = 0
 
 
 class BatchWriteBuffer:

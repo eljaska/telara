@@ -12,7 +12,6 @@ import { VitalChart } from './VitalChart';
 import { ThreatLog } from './ThreatLog';
 import { WellnessGauge } from './WellnessGauge';
 import { HealthChat } from './HealthChat';
-import { Timeline } from './Timeline';
 import { ControlModal } from './ControlModal';
 import { CorrelationInsights } from './CorrelationInsights';
 import { DailyDigest } from './DailyDigest';
@@ -355,18 +354,12 @@ export function Dashboard() {
         {/* Dashboard View - Clean Data Focus */}
         <div className={viewMode === 'dashboard' ? '' : 'hidden'}>
           <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
-            {/* Left Column - Wellness Score & Timeline */}
+            {/* Left Column - Wellness Score & Correlations */}
             <div className="lg:col-span-1 space-y-4">
               <WellnessGauge apiUrl={API_URL} />
               
               {/* Only show correlations on dashboard if not on insights tab */}
               {viewMode === 'dashboard' && <CorrelationInsights apiUrl={API_URL} />}
-              
-              <Timeline 
-                vitals={vitals}
-                alerts={alerts}
-                selectedMetric="heart_rate"
-              />
             </div>
 
             {/* Center Column - Charts */}

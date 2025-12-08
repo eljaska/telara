@@ -23,6 +23,7 @@ multi_producer: MultiSourceProducer = None
 legacy_producer: BiometricProducer = None
 producer_thread: threading.Thread = None
 producer_lock = threading.Lock()
+entrypoint_loop_running = False  # Flag to prevent duplicate loops from /start endpoint
 
 
 def get_multi_producer() -> MultiSourceProducer:
@@ -173,15 +174,16 @@ def get_status():
 @app.route('/start', methods=['POST'])
 def start_generator():
     """Start the multi-source data generator."""
-    global producer_thread
+    global producer_thread, entrypoint_loop_running
     
     with producer_lock:
         p = get_multi_producer()
         
-        if p.running:
+        # Check if already running (either from entrypoint or /start)
+        if p.running or entrypoint_loop_running:
             return jsonify({
                 "status": "already_running",
-                "message": "Generator is already running"
+                "message": "Generator is already running (entrypoint loop active)" if entrypoint_loop_running else "Generator is already running"
             })
         
         # Connect if not connected
@@ -192,7 +194,7 @@ def start_generator():
                     "message": "Failed to connect to Kafka"
                 }), 500
         
-        # Start in background thread
+        # Start in background thread (only if entrypoint loop is not running)
         p.running = True
         producer_thread = threading.Thread(target=run_multi_producer_loop, daemon=True)
         producer_thread.start()
@@ -346,6 +348,12 @@ def run_multi_producer_loop():
         except Exception as e:
             print(f"Error in producer loop: {e}")
             time.sleep(1)
+
+
+def set_entrypoint_loop_running(running: bool):
+    """Set the flag indicating the entrypoint loop is running."""
+    global entrypoint_loop_running
+    entrypoint_loop_running = running
 
 
 def run_control_server(host='0.0.0.0', port=8001):

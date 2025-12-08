@@ -13,7 +13,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from producer import MultiSourceProducer, setup_anomaly_trigger, set_multi_source_producer
-from control_server import app as control_app, get_multi_producer
+from control_server import app as control_app, get_multi_producer, set_entrypoint_loop_running
 
 
 def run_control_server():
@@ -79,6 +79,7 @@ def main():
         
         # Run multi-source producer main loop
         producer.running = True
+        set_entrypoint_loop_running(True)  # Mark that entrypoint loop is active
         interval_sec = producer.base_interval_ms / 1000.0
         last_print_time = 0
         
@@ -108,6 +109,7 @@ def main():
                 print(f"Error in producer loop: {e}")
                 time.sleep(1)
         
+        set_entrypoint_loop_running(False)  # Mark that entrypoint loop has stopped
         producer.shutdown()
     else:
         print("Waiting for start command via control API...")

@@ -37,20 +37,25 @@ export function VitalChart({
   normalRange,
 }: VitalChartProps) {
   const chartData = useMemo(() => {
-    return data.slice(-60).map((d, i) => ({
-      index: i,
-      time: new Date(d.timestamp).toLocaleTimeString('en-US', {
-        hour12: false,
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-      }),
-      value: d[metric],
-      timestamp: d.timestamp,
-    }));
+    // Filter out null/undefined values to create continuous lines
+    return data
+      .filter(d => d[metric] != null)
+      .slice(-60)
+      .map((d, i) => ({
+        index: i,
+        time: new Date(d.timestamp).toLocaleTimeString('en-US', {
+          hour12: false,
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+        }),
+        value: d[metric],
+        timestamp: d.timestamp,
+      }));
   }, [data, metric]);
 
-  const latestValue = data.length > 0 ? data[data.length - 1][metric] : null;
+  // Get latest value from filtered data (not raw data which may have nulls for this metric)
+  const latestValue = chartData.length > 0 ? chartData[chartData.length - 1].value : null;
   
   const getValueColor = (value: number | null) => {
     if (value === null) return '#6e7681';
